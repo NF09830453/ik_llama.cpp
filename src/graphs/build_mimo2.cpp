@@ -21,7 +21,9 @@ ggml_cgraph * llm_build_context::build_mimo2() {
 
     // KQ_mask (mask for 1 head, it will be broadcasted to all heads)
     struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
-    struct ggml_tensor * KQ_mask_swa = build_inp_KQ_mask_swa();
+    struct ggml_tensor * KQ_mask_swa = kv_self.any_compacted()
+        ? build_swa_mask_for_graph(hparams.n_swa, true)
+        : build_inp_KQ_mask_swa();
 
     for (int il = 0; il < n_layer; ++il) {
         const bool is_sliding = model.hparams.swa_layers[il];
