@@ -6603,13 +6603,18 @@ class Step5Model(Model):
         self.gguf_writer.add_sliding_window(int(hparams["sliding_window"]))
         self.gguf_writer.add_sliding_window_pattern([t == "sliding_attention" for t in layer_types])
 
-        # RoPE: per-layer theta (sliding 10k / full 10M), full rotation everywhere
-        # (partial_rotary_factors are all 1.0). The llama3 rope_scaling in the
-        # config is a no-op (factor 1.0), so no rope factor tensors are needed.
+        # RoPE: per-layer theta (sliding 10k / full 10M). Partial rotary factors:
+        # full_attention layers rotate only head_dim/3 (64 of 192 dims), sliding
+        # layers rotate the full head. The llama3 rope_scaling in the config is a
+        # no-op (factor 1.0), so no rope factor tensors are needed.
         rope_theta = hparams["rope_theta"]
         assert len(rope_theta) == self.block_count
-        self.gguf_writer.add_rope_dimension_count(head_dim)
-        self.gguf_writer.add_array(f"{arch}.rope.dimension_count_per_layer", [head_dim] * self.block_count)
+        prf = hparams.get("partial_rotary_factors") or [1.0] * self.block_count
+        assert len(prf) == self.block_count
+        rope_dims = [round(head_dim * float(f)) for f in prf]
+        assert set(rope_dims) == {head_dim, head_dim // 3}
+        self.gguf_writer.add_rope_dimension_count(head_dim // 3)
+        self.gguf_writer.add_array(f"{arch}.rope.dimension_count_per_layer", rope_dims)
         self.gguf_writer.add_rope_freq_base(float(max(rope_theta)))
         self.gguf_writer.add_array(f"{arch}.rope.freq_base_per_layer", [float(t) for t in rope_theta])
         # 0x1 = apply rope scaling to full-attention layers only (yarn_only_types)
