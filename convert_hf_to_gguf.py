@@ -6516,6 +6516,110 @@ class LagunaModel(Model):
                 raise ValueError(f"Unprocessed experts: {experts}")
 
 
+@Model.register("MMGPTStepRoboticsForCausalLM")
+@Model.register("Step4ForCausalLM")
+class Step5Model(Model):
+    # Step-5-Preview / Step-3.5 text model. Runs on the fork's LLM_ARCH_STEP35
+    # dense-fallback path: sparse-GQA indexer tensors (sparse_indexer_*, ssmax_s)
+    # and the vision tower are skipped — see AGENTS.md Phase 2.
+    model_arch = gguf.MODEL_ARCH.STEP35
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # multimodal wrapper: merge text_config over the top-level config
+        tc = self.hparams.get("text_config")
+        if isinstance(tc, dict):
+            self.hparams = {**self.hparams, **tc}
+        # num_hidden_layers (92) counts only the trunk; the MTP/nextn layers are
+        # real blocks in the GGUF (blk.92..blk.94).
+        nextn = int(self.hparams.get("num_nextn_predict_layers", 0) or 0)
+        self.block_count = int(self.hparams["num_hidden_layers"]) + nextn
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    def find_hparam(self, keys: Iterable[str], optional: bool = False) -> Any:
+        # base __init__ resolves block_count before we can merge text_config
+        key = next((k for k in keys if k in self.hparams), None)
+        if key is not None:
+            return self.hparams[key]
+        tc = self.hparams.get("text_config")
+        if isinstance(tc, dict):
+            key = next((k for k in keys if k in tc), None)
+            if key is not None:
+                return tc[key]
+        if optional:
+            return None
+        raise KeyError(f"could not find any of: {keys}")
+
+    def set_gguf_parameters(self):
+        hparams = self.hparams
+        arch = gguf.MODEL_ARCH_NAMES[self.model_arch]
+        n_layers = int(hparams["num_hidden_layers"])
+        nextn = int(hparams.get("num_nextn_predict_layers", 0) or 0)
+        n_head = int(hparams["num_attention_heads"])
+        n_kv = int(hparams["num_attention_groups"])
+        head_dim = int(hparams["head_dim"])
+
+        self.gguf_writer.add_context_length(int(hparams["max_position_embeddings"]))
+        self.gguf_writer.add_embedding_length(int(hparams["hidden_size"]))
+        self.gguf_writer.add_block_count(self.block_count)
+        self.gguf_writer.add_vocab_size(int(hparams["vocab_size"]))
+        self.gguf_writer.add_feed_forward_length(int(hparams["intermediate_size"]))
+        self.gguf_writer.add_head_count(n_head)
+        self.gguf_writer.add_head_count_kv(n_kv)
+        self.gguf_writer.add_key_length(head_dim)
+        self.gguf_writer.add_value_length(head_dim)
+        self.gguf_writer.add_layer_norm_rms_eps(float(hparams["rms_norm_eps"]))
+        self.gguf_writer.add_file_type(self.ftype)
+
+        # sliding-window attention: layer_types has one entry per block (incl. MTP)
+        layer_types = hparams["layer_types"]
+        assert len(layer_types) == self.block_count
+        self.gguf_writer.add_sliding_window(int(hparams["sliding_window"]))
+        self.gguf_writer.add_sliding_window_pattern([t == "sliding_attention" for t in layer_types])
+
+        # RoPE: per-layer theta (sliding 10k / full 10M), full rotation everywhere
+        # (partial_rotary_factors are all 1.0). The llama3 rope_scaling in the
+        # config is a no-op (factor 1.0), so no rope factor tensors are needed.
+        rope_theta = hparams["rope_theta"]
+        assert len(rope_theta) == self.block_count
+        self.gguf_writer.add_rope_dimension_count(head_dim)
+        self.gguf_writer.add_array(f"{arch}.rope.dimension_count_per_layer", [head_dim] * self.block_count)
+        self.gguf_writer.add_rope_freq_base(float(max(rope_theta)))
+        self.gguf_writer.add_array(f"{arch}.rope.freq_base_per_layer", [float(t) for t in rope_theta])
+        # 0x1 = apply rope scaling to full-attention layers only (yarn_only_types)
+        self.gguf_writer.add_uint32(f"{arch}.rope.scaling.apply_mask", 1)
+
+        # MoE
+        self.gguf_writer.add_expert_count(int(hparams["moe_num_experts"]))
+        self.gguf_writer.add_expert_used_count(int(hparams["num_experts_per_tok"]))
+        self.gguf_writer.add_expert_feed_forward_length(int(hparams["moe_intermediate_size"]))
+        self.gguf_writer.add_expert_shared_feed_forward_length(int(hparams["share_expert_dim"]))
+        self.gguf_writer.add_expert_weights_scale(float(hparams["moe_router_scaling_factor"]))
+        self.gguf_writer.add_expert_weights_norm(bool(hparams["norm_expert_weight"]))
+        self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
+
+        # MTP + swiglu clamps (arrays span trunk + MTP blocks)
+        self.gguf_writer.add_nextn_predict_layers(nextn)
+        self.gguf_writer.add_array(f"{arch}.swiglu_limits", [float(v) for v in hparams["swiglu_limits"]])
+        self.gguf_writer.add_array(f"{arch}.swiglu_limits_shared", [float(v) for v in hparams["swiglu_limits_shared"]])
+
+        template_file = self.dir_model / "chat_template.jinja"
+        if template_file.is_file():
+            self.gguf_writer.add_chat_template(template_file.read_text(encoding="utf-8"))
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # Phase 1 dense fallback: no sparse-GQA indexer, no vision tower
+        if "sparse_indexer" in name or "ssmax_s" in name:
+            return []
+        if name.startswith(("vision_model.", "vit")):
+            return []
+        if name.endswith("moe.router_bias"):
+            # suffix-less tensor; the C++ loader asks for blk.{b}.exp_probs_b.bias
+            assert bid is not None
+            return [(f"blk.{bid}.exp_probs_b.bias", data_torch)]
+        return [(self.map_tensor_name(name), data_torch)]
+
+
 ###### CONVERSION LOGIC ######
 
 
