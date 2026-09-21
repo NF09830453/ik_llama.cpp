@@ -6634,9 +6634,15 @@ class Step5Model(Model):
             self.gguf_writer.add_chat_template(template_file.read_text(encoding="utf-8"))
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        # Phase 1 dense fallback: no sparse-GQA indexer, no vision tower
-        if "sparse_indexer" in name or "ssmax_s" in name:
-            return []
+        # Sparse-GQA indexer tensors are KEPT in the GGUF under blk.{b}.indexer.*
+        # names (the Phase-2 name contract) so the BF16 master never needs
+        # re-conversion; the dense-fallback loader skip-accounts them.
+        m = re.match(r"model\.layers\.(\d+)\.self_attn\.(sparse_indexer_[a-z_]+|ssmax_s)(?:\.(weight|bias))?$", name)
+        if m:
+            part = m.group(2).replace("sparse_indexer_", "")
+            suffix = f".{m.group(3)}" if m.group(3) else ""
+            return [(f"blk.{m.group(1)}.indexer.{part}{suffix}", data_torch)]
+        # Vision belongs in a separate mmproj GGUF, not the text master.
         if name.startswith(("vision_model.", "vit")):
             return []
         if name.endswith("moe.router_bias"):

@@ -1344,6 +1344,20 @@ bool create_tensors_helper::create_step35_tensors(const LLM_TN & tn) {
             layer.nextn.shared_head_norm = create_tensor(ctx_split,
                     tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), {n_embd}, optional_layer_flags);
         }
+
+        // Step-5 sparse-GQA indexer tensors (full-attention layers only). They are
+        // carried in the GGUF for future sparse-attention support, but the dense
+        // fallback graph never references them. Request-and-skip each tensor by
+        // exact name so the loader's tensor accounting stays exact (per-tensor,
+        // never per-block, to avoid skipping shared trunk tensors).
+        for (const char * part : {"q.weight", "k.weight", "z.weight", "w.weight",
+                                  "q_norm.weight", "k_norm.weight", "k_norm.bias", "ssmax_s"}) {
+            const std::string idx_name = format("blk.%d.indexer.%s", i, part);
+            if (const auto * idx_meta = ml.get_tensor_meta(idx_name.c_str())) {
+                create_tensor(ctx_split, idx_name, {idx_meta->ne[0], idx_meta->ne[1]},
+                        llama_model_loader::TENSOR_SKIP | llama_model_loader::TENSOR_NOT_REQUIRED);
+            }
+        }
     }
     return use_mmap_buffer;
 }
