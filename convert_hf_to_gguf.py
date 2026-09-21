@@ -616,6 +616,10 @@ class Model:
         if chkhsh == "8aeee3860c56296a157a1fe2fad249ec40aa59b1bb5709f4ade11c4e6fe652ed":
             # ref: https://huggingface.co/tiiuae/falcon-7b
             res = "falcon"
+        if chkhsh == "5841594bd6a8eeecd7207aeec6570831cc97ffaeba51e908bdaf560113177bae":
+            # ref: Step-5-Preview (StepFun); pre-tokenizer regexes are identical
+            # to DeepSeek-V3 (digit split + CJK split + main split)
+            res = "deepseek-v3"
         if chkhsh == "0876d13b50744004aa9aeae05e7b0647eac9d801b5ba4668afc01e709c15e19f":
             # ref: https://huggingface.co/BAAI/bge-small-en-v1.5
             res = "bert-bge"
@@ -6535,6 +6539,28 @@ class Step5Model(Model):
         nextn = int(self.hparams.get("num_nextn_predict_layers", 0) or 0)
         self.block_count = int(self.hparams["num_hidden_layers"]) + nextn
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    def get_tensors(self) -> Iterator[tuple[str, Tensor]]:
+        # This checkpoint ships redundant physical copies: stray shards not in
+        # the index (model-mtp3-00001.safetensors) and trunk-layer copies inside
+        # other shards (layer 92 in model-00024). The index's weight_map is
+        # authoritative, so skip any tensor whose canonical copy lives in a
+        # different shard.
+        index_path = self.dir_model / "model.safetensors.index.json"
+        if not index_path.is_file():
+            yield from super().get_tensors()
+            return
+        with open(index_path, "r", encoding="utf-8") as f:
+            weight_map: dict[str, str] = json.load(f).get("weight_map") or {}
+        for part_name in self.part_names:
+            logger.info(f"gguf: loading model part '{part_name}'")
+            from safetensors import safe_open
+            with safe_open(self.dir_model / part_name, framework="pt", device="cpu") as model_part:
+                for name in model_part.keys():
+                    if weight_map.get(name, part_name) != part_name:
+                        continue
+                    data = model_part.get_slice(name)
+                    yield name, LazyTorchTensor.from_safetensors_slice(data)
 
     def find_hparam(self, keys: Iterable[str], optional: bool = False) -> Any:
         # base __init__ resolves block_count before we can merge text_config
