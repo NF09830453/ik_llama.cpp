@@ -1763,8 +1763,12 @@ void llm_load_hparams(
                 bool have_rfb_train_swa = ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA, hparams.rope_freq_base_train_swa, false);
                 ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer);
                 if (!ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_COUNT_PER_LAYER, hparams.rope_dim_per_layer, hparams.n_layer, false)) {
+                    // Mainline-style files: rope.dimension_count = full-attn rotary,
+                    // rope.dimension_count_swa = SWA-layer rotary (Step-5: 64 / 192).
+                    uint32_t n_rot_swa_file = hparams.n_rot;
+                    ml.get_key(LLM_KV_ROPE_DIMENSION_COUNT_SWA, n_rot_swa_file, false);
                     for (int i = 0; i < hparams.n_layer; ++i) {
-                        hparams.rope_dim_per_layer[i] = hparams.swa_layers[i] ? hparams.n_rot : hparams.n_rot/2;
+                        hparams.rope_dim_per_layer[i] = hparams.swa_layers[i] ? n_rot_swa_file : hparams.n_rot;
                     }
                 }
                 // The following two parameters: one of the two versions must be present in the GGUF
