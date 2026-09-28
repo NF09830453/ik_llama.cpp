@@ -42,6 +42,17 @@ static bool ik_hadamard_enabled() {
     static const bool on = getenv("IK_HADAMARD") == nullptr || atoi(getenv("IK_HADAMARD")) != 0;
     return on;
 }
+// IK_SPARSE (default 0 = dense telemetry-only; IK_SPARSE=1 activates indexer selection):
+// top-M rank-penalty sparse mask -> build_std_attention additive mask on FULL attn layers (SWA
+// unchanged). Frozen per process like IK_HADAMARD (selection must stay consistent with the
+// cached-key set across decode steps). Dense-equivalence oracle (G1 plumbing): at ctx <= topk the
+// builder's clamp makes pen(rank)==0 for every key, so the sparse mask == the causal mask BITWISE
+// and IK_SPARSE=1 reproduces IK_SPARSE=0 logits EXACTLY (Tier-1: dump logits under both knobs,
+// diff). Default flips to 1 only after G1-G3 gates green (user call) -- until then opt-in.
+static bool ik_sparse_enabled() {
+    static const bool on = getenv("IK_SPARSE") != nullptr && atoi(getenv("IK_SPARSE")) != 0;
+    return on;
+}
 
 void llm_build_context::build_step35_indexer_kv_write(ggml_cgraph * gf, int il, ggml_tensor * inpL) {
     const int64_t head_size = hparams.indexer_head_size;
@@ -92,16 +103,18 @@ void llm_build_context::build_step35_indexer_kv_write(ggml_cgraph * gf, int il, 
 // Scores = relu(q·k)·w summed over proxy heads, seeded with the causal KQ_mask -- the fork DSA
 // precedent (build_deepseek2.cpp:488); Slice 3 swaps in ssmax/block-compress/selection semantics
 // behind env knobs. Skipped on SWA layers / MTP tail (write and score guards mirror each other).
+// Returns the causal-seeded score {n_kv, n_tokens} (F32) for the IK_SPARSE selection skeleton,
+// nullptr on layers without an indexer cache entry.
 // Perf note (Slice 3): the cached span is cast to F32 for the pe RoPE; fine at gate contexts,
 // revisit (quantized nope matmul + cast only the pe slice) before 1M-ctx decode work.
-void llm_build_context::build_step35_indexer_score(ggml_cgraph * gf, int il,
+ggml_tensor * llm_build_context::build_step35_indexer_score(ggml_cgraph * gf, int il,
         ggml_tensor * inpL, ggml_tensor * inp_pos, ggml_tensor * KQ_mask) {
     const int64_t head_size = hparams.indexer_head_size; // proxy_dim (HF sparse_config: 256)
     const int64_t n_ihead   = hparams.indexer_n_head;    // proxy q heads (HF num_heads: 16)
 
     ggml_tensor * kr_cache = (size_t) il < kv_self.kr_l.size() ? kv_self.kr_l[il] : nullptr;
     if (!kr_cache || !hparams.indexer_is_full[il]) {
-        return;
+        return nullptr;
     }
     GGML_ASSERT(head_size > 0 && n_ihead > 0);
     GGML_ASSERT(n_kv > 0 && n_kv <= (int64_t) kv_self.size);
@@ -231,6 +244,7 @@ void llm_build_context::build_step35_indexer_score(ggml_cgraph * gf, int il,
     indexer_score = ggml_add(ctx0, indexer_score, score);
     cb(indexer_score, "step35_indexer_score", il);
     ggml_build_forward_expand(gf, indexer_score);
+    return indexer_score;
 }
 
 ggml_cgraph * llm_build_context::build_step35() {
@@ -304,10 +318,33 @@ ggml_cgraph * llm_build_context::build_step35() {
         // Slice 1/2 plumbing: proxy-key cache write (real proxy key: k_norm(k_proj), RAW) +
         // read-back scoring telemetry (semantic selection core deferred to Slice 3 knobs).
         build_step35_indexer_kv_write(gf, il, inpL);
-        build_step35_indexer_score(gf, il, inpL, inp_pos, KQ_mask);
+        ggml_tensor * idx_score = build_step35_indexer_score(gf, il, inpL, inp_pos, KQ_mask);
+
+        // ---- Stage B IK_SPARSE selection skeleton (mask-based sparse attention FIRST) ----
+        // Reuses the arch-neutral DSA members verbatim: full descending argsort over the n_kv axis
+        // -> rank-penalty scatter mask (build_deepseek2_dsa_sparse_mask; the --dsa-top-k/-dsatk
+        // kept-key-count characterization knob applies here too) -> FA adapter (…_dsa_fa_mask)
+        // when -fa 1 needs the F16 padded contiguous mask shape. ALWAYS built under IK_SPARSE=1,
+        // deliberately NO n_kv <= topk short-circuit: at ctx <= topk the clamp makes pen(rank)==0
+        // for every key, so the mask == the causal mask BITWISE and logits == IK_SPARSE=0 dense
+        // EXACTLY -- the G1 dense-equivalence oracle therefore exercises the whole argsort/scatter
+        // path instead of bypassing it. Cost at ctx <= topk is trivial; gather/fused-indexer
+        // bandwidth wins stay on the 1M-ctx decode TODO list (AGENTS.md strategy).
+        ggml_tensor * attn_mask = is_swa ? KQ_mask_swa : KQ_mask;
+        if (!is_swa && ik_sparse_enabled() && idx_score) {
+            ggml_tensor * sorted = ggml_argsort(ctx0, idx_score, GGML_SORT_ORDER_DESC);
+            cb(sorted, "step35_indexer_sorted", il);
+            ggml_tensor * sparse = build_deepseek2_dsa_sparse_mask(sorted, KQ_mask);
+            cb(sparse, "step35_sparse_mask", il); // rename tap for step35 G4 telemetry
+            if (flash_attn) {
+                sparse = build_deepseek2_dsa_fa_mask(sparse, KQ_mask);
+                cb(sparse, "step35_sparse_mask_fa", il);
+            }
+            attn_mask = sparse;
+        }
         cur = build_std_attention(gf, model.layers[il].attn_norm, inpL,
                 inp_pos, il == n_layer_base - 1 && n_tokens > 1 && !cparams.mtp ? inp_out_ids : nullptr,
-                rope_factors, is_swa ? KQ_mask_swa : KQ_mask, nullptr, nullptr, kq_scale, 0.0f, is_swa ? hparams.n_swa : 0,
+                rope_factors, attn_mask, nullptr, nullptr, kq_scale, 0.0f, is_swa ? hparams.n_swa : 0,
                 il, true, false, true);
         layer.rope_freqs = rope_freqs;
 

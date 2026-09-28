@@ -451,7 +451,9 @@ struct llm_build_context {
     // Slice 2: STEP35 proxy forward (q/z/w proj, q_norm rmsnorm) + indexer-key read-back scoring
     // telemetry. Keys stay RAW in kr_l; the pe/nope RoPE split (rope_dim = indexer_rope_dim) is
     // applied at read-back (q at inp_pos, cached k at inp_kv_pos). Semantic knobs land in Slice 3.
-    void build_step35_indexer_score(ggml_cgraph * gf, int il, ggml_tensor * inpL,
+    // Returns the causal-seeded indexer score {n_kv, n_tokens} (F32) for the IK_SPARSE selection
+    // skeleton (Stage B), or nullptr on layers without an indexer (SWA / MTP tail).
+    ggml_tensor * build_step35_indexer_score(ggml_cgraph * gf, int il, ggml_tensor * inpL,
             ggml_tensor * inp_pos, ggml_tensor * KQ_mask);
 
     ggml_tensor * build_step35_mtp(
