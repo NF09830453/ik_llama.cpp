@@ -25,6 +25,24 @@
 // Shapes/score logic ported INLINE from build_deepseek2_dsa_indexer (build_deepseek2.cpp:374;
 // k_norm layernorm+bias :417, pe/nope split rope_dim 32, per-head w + sum :488) -- port logic,
 // not dependencies.
+
+// ---- Slice 3 semantic knobs (env, read ONCE per process) ----
+// Fork precedent: DSA_HADAMARD_DISABLE frozen at first build (build_deepseek2.cpp:440). Frozen
+// values keep cache contents self-consistent within a process (flipping IK_HADAMARD mid-process
+// would mix rotated/unrotated cached rows). Future IK_* knobs (IK_SPARSE/IK_CSA_*/IK_SSMAX_*)
+// land here as semantic candidates arrive.
+// IK_HADAMARD (default 1; IK_HADAMARD=0 disables): Walsh-Hadamard whitening of proxy keys
+// BEFORE the idx_type_k cache write, de-rotated at read-back (ggml_hadamard is orthonormal,
+// H^2 == I -- hadamard.cu accumulates 1/sqrt(2) per butterfly stage). Quantizing whitened keys
+// spreads each dim's energy over all quant blocks -> cache-Q8 error decorrelates from the score
+// (Q8 ~= F16 KV-cache precision win). Exact-arithmetic scores identical to IK_HADAMARD=0:
+// rope(H(H k_raw)) == rope(k_raw), so all plumbing invariants (T5 RAW/position-free write,
+// T6b split taps) hold under either knob value.
+static bool ik_hadamard_enabled() {
+    static const bool on = getenv("IK_HADAMARD") == nullptr || atoi(getenv("IK_HADAMARD")) != 0;
+    return on;
+}
+
 void llm_build_context::build_step35_indexer_kv_write(ggml_cgraph * gf, int il, ggml_tensor * inpL) {
     const int64_t head_size = hparams.indexer_head_size;
 
@@ -42,6 +60,16 @@ void llm_build_context::build_step35_indexer_kv_write(ggml_cgraph * gf, int il, 
     src = llm_build_norm(ctx0, src, hparams, layer.indexer_k_norm, layer.indexer_k_norm_b, LLM_NORM, cb, il);
     cb(src, "step35_indexer_k_raw", il);
     GGML_ASSERT(src->ne[0] == head_size && src->ne[1] == n_tokens);
+
+    // IK_HADAMARD whitening BEFORE the cache-type cast: the quantizer sees rotated values --
+    // that is where the precision win lives. Row blocks of head_size (power of 2; ggml_hadamard
+    // aborts otherwise -- IK_HADAMARD=0 for exotic toy dims).
+    if (ik_hadamard_enabled()) {
+        GGML_ASSERT(head_size > 1 && (head_size & ~(head_size - 1)) == head_size);
+        src = ggml_hadamard(ctx0, src, (int) head_size);
+        cb(src, "step35_indexer_k_rot", il);
+    }
+
     src = ggml_cast(ctx0, ggml_cont(ctx0, src), kr_cache->type);
     cb(src, "step35_kr_plumb_src", il);
 
@@ -80,6 +108,14 @@ void llm_build_context::build_step35_indexer_score(ggml_cgraph * gf, int il,
 
     const auto & layer = model.layers[il];
     GGML_ASSERT(layer.indexer_q && layer.indexer_z && layer.indexer_w && layer.indexer_q_norm);
+
+    // Tier-0 oracle tap: the layer input itself (view, no copy -- avoids renaming inpL which
+    // may alias an earlier cb()-named tensor). _oracle_step35.py replays the whole indexer
+    // chain from this tap + mini weights (build_step35_indexer_inpL).
+    GGML_ASSERT(inpL->ne[2] == 1);
+    ggml_tensor * inpL_view = ggml_view_2d(ctx0, inpL, inpL->ne[0], inpL->ne[1], inpL->nb[1], 0);
+    cb(inpL_view, "step35_indexer_inpL", il);
+    ggml_build_forward_expand(gf, inpL_view); // dangling telemetry must ROOT in the graph
 
     // pe/nope split over indexer_rope_dim (HF sparse_indexer_rope_dim: 32); clamped so toy
     // harness dims (proxy_dim <= rope_dim) rope the whole proxy instead of building empty views.
@@ -129,6 +165,9 @@ void llm_build_context::build_step35_indexer_score(ggml_cgraph * gf, int il,
     // w ≡ fork DSA per-head indexer weights) ----
     ggml_tensor * z_cur = ggml_mul_mat(ctx0, layer.indexer_z, inpL); // {head_size, n_tokens}
     cb(z_cur, "step35_indexer_z_raw", il);
+    ggml_build_forward_expand(gf, z_cur); // z is telemetry-only: unconsumed cb() tensors never
+                                          // enter the graph and cb_eval never fires (inp_dsa_sink
+                                          // precedent) -- root it explicitly
 
     ggml_tensor * w_cur = ggml_mul_mat(ctx0, layer.indexer_w, inpL); // {n_ihead, n_tokens}
     w_cur = ggml_scale(ctx0, w_cur, 1.0f / sqrtf(float(head_size * n_ihead))); // DSA :488 port
@@ -137,7 +176,16 @@ void llm_build_context::build_step35_indexer_score(ggml_cgraph * gf, int il,
     // ---- read back the cached RAW proxy keys ({head_size, n_kv}), rope pe at read-back ----
     ggml_tensor * cached_k = ggml_view_2d(ctx0, kr_cache, head_size, n_kv,
             ggml_row_size(kr_cache->type, head_size), 0);
-    ggml_tensor * k_f32 = ggml_cast(ctx0, ggml_cont(ctx0, cached_k), GGML_TYPE_F32);
+    // IK_HADAMARD de-rotation (H^2 == I; ggml_hadamard outputs F32 so it slots in for the cast).
+    // Result = the raw proxy key modulo cache quantization noise -> pe RoPE below sees the same
+    // raw-domain key as IK_HADAMARD=0.
+    ggml_tensor * k_f32;
+    if (ik_hadamard_enabled()) {
+        k_f32 = ggml_hadamard(ctx0, cached_k, (int) head_size);
+        cb(k_f32, "step35_indexer_k_derot", il);
+    } else {
+        k_f32 = ggml_cast(ctx0, ggml_cont(ctx0, cached_k), GGML_TYPE_F32);
+    }
     cb(k_f32, "step35_indexer_cached_k", il);
 
     ggml_tensor * k_pe = ggml_view_3d(ctx0, k_f32, rope_dim, 1, n_kv,
