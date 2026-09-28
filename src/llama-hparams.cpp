@@ -1742,6 +1742,13 @@ void llm_load_hparams(
         case LLM_ARCH_STEP35:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                // Step-5 sparse-GQA indexer k_norm is a (non-RMS) LayerNorm built via LLM_NORM,
+                // which uses hparams.f_norm_eps in ggml_norm(). The GGUF only carries the RMS eps,
+                // so f_norm_eps stays 0 and CPU ggml_norm aborts (GGML_ASSERT(eps > 0)). On CUDA
+                // the kernel does not assert (eps=0 is numerically tolerable), so this only bites
+                // the CPU path. Mirror the RMS eps so the indexer LayerNorm gets a valid epsilon
+                // on all backends (same precedent as the GLM-DSA/DeepSeek4 case above).
+                if (hparams.f_norm_eps <= 0.0f) hparams.f_norm_eps = hparams.f_norm_rms_eps;
                 ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
                 if (hparams.nextn_predict_layers > hparams.n_layer) {
                     throw std::runtime_error(format("step35.nextn_predict_layers (%u) exceeds block_count (%u)",

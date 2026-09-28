@@ -5256,6 +5256,20 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
     const auto & cparams = lctx.cparams;
     const auto & kv_self = lctx.kv_self;
 
+    if (lctx.inp_kv_pos) {
+        // STEP35 sparse-GQA indexer read-back RoPE: absolute position of each cached-proxy-key cell
+        // in the scored span [0, n_kv), filled from kv_self.cells like the KQ_mask / inp_dsa_sink.
+        // Empty cells clamp to 0 -- they are masked out of the indexer scores anyway.
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_kv_pos->buffer));
+        const int64_t n_kv = lctx.inp_kv_pos->ne[0];
+        GGML_ASSERT(n_kv <= kv_self.size);
+        int32_t * data = (int32_t *) lctx.inp_kv_pos->data;
+        for (int64_t i = 0; i < n_kv; ++i) {
+            const llama_pos p = kv_self.cells[i].pos;
+            data[i] = p < 0 ? 0 : (int32_t) p;
+        }
+    }
+
     if (lctx.inp_dsa_sink) {
         // Per-sequence attention-sink boost for the DSA lightning indexer top-k selection.
         // inp_dsa_sink {n_kv, n_tokens}: 1e20 iff key cell i is one of query j's sequence's FIRST

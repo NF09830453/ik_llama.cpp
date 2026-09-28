@@ -111,6 +111,7 @@ void llm_build_context::init() {
         lctx.inp_KQ_mask_swa_win = nullptr;
         lctx.swa_window_view = {};
         lctx.inp_K_shift     = nullptr;
+        lctx.inp_kv_pos      = nullptr;
         lctx.inp_mean        = nullptr;
         lctx.inp_cls         = nullptr;
         lctx.inp_s_copy      = nullptr;

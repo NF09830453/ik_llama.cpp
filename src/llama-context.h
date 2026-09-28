@@ -637,6 +637,7 @@ struct llama_context {
     struct ggml_tensor * inp_mtp_states = nullptr;
     struct ggml_tensor * inp_mtp_carry = nullptr; // F32 [n_embd, nextn-1] per-head hidden at the last committed position
     struct ggml_tensor * inp_dsa_sink = nullptr; // F32 [n_kv, n_tokens] per-sequence attention-sink boost for DSA indexer top-k
+    struct ggml_tensor * inp_kv_pos = nullptr;   // I32 [n_kv] cached-cell positions (STEP35 indexer read-back RoPE; llama_set_inputs fill from kv_self.cells)
 
     // Qwen sparse attention: everything that depends on cache layout is computed on the host,
     // so the graph only gathers, pools and scores. One entry per distinct compress ratio.

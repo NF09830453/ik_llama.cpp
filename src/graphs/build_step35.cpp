@@ -2,27 +2,29 @@
 #include "../llama-model.h"
 #include "../llama-context.h"
 
-// Step-5 sparse GQA indexer: persistent proxy-key cache plumbing (Slice 1, SEMANTICS-FREE).
+// Step-5 sparse GQA indexer: persistent proxy-key cache plumbing (Slice 1) + proxy forward &
+// read-back scoring telemetry (Slice 2). Semantic selection core lands in Slice 3 env knobs.
 //
 // kv_self.kr_l[il] ([indexer_head_size == proxy_dim, kv_size], idx_type_k) holds one proxy
-// indexer key per cached cell on FULL-attn layers only (SWA layers carry no indexer). Slice 1
-// wires storage + maintenance only:
-//   - write:  one ggml_cpy per graph, rows kv_head..kv_head+n_tokens, registered in
+// indexer key per cached cell on FULL-attn layers only (SWA layers carry no indexer):
+//   - write:  ggml_cpy per graph, rows kv_head..kv_head+n_tokens, registered in
 //             lctx.dsa_cache_copies so llama_context::update_cache_copies() re-points the
 //             baked view_offs when a graph is reused (GLM-DSA dsa_cache_copies pattern).
 //             Without that registration a reused decode graph keeps scattering this ubatch's
 //             keys into the first ubatch's slot.
 //   - defrag: rows follow their cells (generic kr_l block in llm_build_context::build_defrag).
-//   - shift:  rows carry NO position encoding yet, so a K-shift leaves them untouched --
-//             "copy-through" by construction (see llm_build_context::build_k_shift()).
+//   - shift:  rows carry NO position encoding (RoPE is applied at READ-BACK), so a K-shift
+//             leaves them untouched -- "copy-through" by construction (build_k_shift()).
 //
-// The WRITE SOURCE is deliberately semantics-free: the first indexer_head_size dims of this
-// layer's input hidden state, cast to idx_type_k. It is deterministic per (layer, token), so
-// plumbing tests can discriminate cache slots, and Slice 2 replaces it with the real proxy
-// key (q/k proj + q_norm/k_norm + rope pe/nope split) behind this same cpy/register machinery.
-// If Slice 2 folds RoPE into the cached key at write time it MUST also extend build_k_shift()
-// with the matching pe delta-rotation (GLM-DSA precedent); caching the raw key and RoPE-ing at
-// read-back keeps the shift invariant above intact instead.
+// Slice 2 write source = the REAL proxy key: k_norm(k_proj(inpL)) over proxy_dim, cached RAW.
+// k_norm is position-independent so it belongs at write time; only the pe RoPE (pe/nope split
+// over indexer_rope_dim) is deferred to read-back, where the cached key is rotated by its cell's
+// absolute position (lctx.inp_kv_pos, host-filled from kv_self.cells in llama_set_inputs) and the
+// proxy query by inp_pos. RoPE-at-read-back keeps the Slice 1 key = position-free invariant above
+// intact (harness T5 asserts it) and keeps block pooling over cached keys CSA-friendly.
+// Shapes/score logic ported INLINE from build_deepseek2_dsa_indexer (build_deepseek2.cpp:374;
+// k_norm layernorm+bias :417, pe/nope split rope_dim 32, per-head w + sum :488) -- port logic,
+// not dependencies.
 void llm_build_context::build_step35_indexer_kv_write(ggml_cgraph * gf, int il, ggml_tensor * inpL) {
     const int64_t head_size = hparams.indexer_head_size;
 
@@ -30,9 +32,16 @@ void llm_build_context::build_step35_indexer_kv_write(ggml_cgraph * gf, int il, 
     if (!kr_cache || !hparams.indexer_is_full[il]) {
         return;
     }
-    GGML_ASSERT(head_size > 0 && head_size <= inpL->ne[0]);
+    GGML_ASSERT(head_size > 0);
 
-    ggml_tensor * src = ggml_view_2d(ctx0, inpL, head_size, n_tokens, inpL->nb[1], 0);
+    // Slice 2: real proxy key = k_norm(k_proj(inpL)) over proxy_dim, cached RAW (no RoPE).
+    // Ported inline from build_deepseek2_dsa_indexer (build_deepseek2.cpp:417).
+    const auto & layer = model.layers[il];
+    GGML_ASSERT(layer.indexer_k && layer.indexer_k_norm && "STEP35 indexer k tensors missing");
+    ggml_tensor * src = ggml_mul_mat(ctx0, layer.indexer_k, inpL); // {head_size, n_tokens}
+    src = llm_build_norm(ctx0, src, hparams, layer.indexer_k_norm, layer.indexer_k_norm_b, LLM_NORM, cb, il);
+    cb(src, "step35_indexer_k_raw", il);
+    GGML_ASSERT(src->ne[0] == head_size && src->ne[1] == n_tokens);
     src = ggml_cast(ctx0, ggml_cont(ctx0, src), kr_cache->type);
     cb(src, "step35_kr_plumb_src", il);
 
@@ -49,6 +58,131 @@ void llm_build_context::build_step35_indexer_kv_write(ggml_cgraph * gf, int il, 
     lctx.dsa_cache_copies[il].step = kr_cache->nb[1];
 
     ggml_build_forward_expand(gf, kr_cpy);
+}
+
+// Slice 2: proxy forward (q/z/w proj + q_norm rmsnorm) + indexer-key read-back scoring telemetry.
+// Scores = relu(q·k)·w summed over proxy heads, seeded with the causal KQ_mask -- the fork DSA
+// precedent (build_deepseek2.cpp:488); Slice 3 swaps in ssmax/block-compress/selection semantics
+// behind env knobs. Skipped on SWA layers / MTP tail (write and score guards mirror each other).
+// Perf note (Slice 3): the cached span is cast to F32 for the pe RoPE; fine at gate contexts,
+// revisit (quantized nope matmul + cast only the pe slice) before 1M-ctx decode work.
+void llm_build_context::build_step35_indexer_score(ggml_cgraph * gf, int il,
+        ggml_tensor * inpL, ggml_tensor * inp_pos, ggml_tensor * KQ_mask) {
+    const int64_t head_size = hparams.indexer_head_size; // proxy_dim (HF sparse_config: 256)
+    const int64_t n_ihead   = hparams.indexer_n_head;    // proxy q heads (HF num_heads: 16)
+
+    ggml_tensor * kr_cache = (size_t) il < kv_self.kr_l.size() ? kv_self.kr_l[il] : nullptr;
+    if (!kr_cache || !hparams.indexer_is_full[il]) {
+        return;
+    }
+    GGML_ASSERT(head_size > 0 && n_ihead > 0);
+    GGML_ASSERT(n_kv > 0 && n_kv <= (int64_t) kv_self.size);
+
+    const auto & layer = model.layers[il];
+    GGML_ASSERT(layer.indexer_q && layer.indexer_z && layer.indexer_w && layer.indexer_q_norm);
+
+    // pe/nope split over indexer_rope_dim (HF sparse_indexer_rope_dim: 32); clamped so toy
+    // harness dims (proxy_dim <= rope_dim) rope the whole proxy instead of building empty views.
+    const int64_t rope_dim = std::min<int64_t>(
+            hparams.indexer_rope_dim > 0 ? hparams.indexer_rope_dim : head_size, head_size);
+    const int64_t nope_dim = head_size - rope_dim;
+
+    // Cached-cell positions for the read-back pe RoPE (mirrors inp_dsa_sink: per-graph input,
+    // host-filled in llama_set_inputs from kv_self.cells). RAW cached keys + this tensor are what
+    // keeps the Slice 1 K-shift invariant: cached rows depend on position only at read-back.
+    // The fill runs right before graph compute and ggml_rope_ext reads it DURING compute, so the
+    // positions are always fresh; after decode the compute buffer is clobbered (not observable
+    // post-hoc -- verified structurally in the harness, values gated in Slice 3).
+    if (!lctx.inp_kv_pos) {
+        lctx.inp_kv_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_kv);
+        cb(lctx.inp_kv_pos, "kv_pos", -1);
+        ggml_set_input(lctx.inp_kv_pos);
+        ggml_build_forward_expand(gf, lctx.inp_kv_pos); // match inp_dsa_sink (build_deepseek2.cpp:1274)
+    }
+
+    // ---- proxy q: rmsnorm(q_proj(inpL)) over proxy_dim per head, pe rope at query pos ----
+    ggml_tensor * q_cur = ggml_mul_mat(ctx0, layer.indexer_q, inpL); // {head_size*n_ihead, n_tokens}
+    q_cur = ggml_view_3d(ctx0, q_cur, head_size, n_ihead, n_tokens,
+            ggml_row_size(q_cur->type, head_size),
+            ggml_row_size(q_cur->type, head_size) * n_ihead, 0);
+    q_cur = llm_build_norm(ctx0, q_cur, hparams, layer.indexer_q_norm, nullptr, LLM_NORM_RMS, cb, il);
+    cb(q_cur, "step35_indexer_q_normed", il);
+
+    ggml_tensor * q_pe = ggml_view_3d(ctx0, q_cur, rope_dim, n_ihead, n_tokens,
+            ggml_row_size(q_cur->type, head_size),
+            ggml_row_size(q_cur->type, head_size) * n_ihead, 0);
+    q_pe = ggml_rope_ext(ctx0, q_pe, inp_pos, nullptr, rope_dim,
+            rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+    if (nope_dim > 0) {
+        ggml_tensor * q_nope = ggml_view_3d(ctx0, q_cur, nope_dim, n_ihead, n_tokens,
+                ggml_row_size(q_cur->type, head_size),
+                ggml_row_size(q_cur->type, head_size) * n_ihead,
+                ggml_row_size(q_cur->type, rope_dim));
+        q_cur = ggml_concat(ctx0, q_pe, q_nope, 0);
+    } else {
+        q_cur = q_pe;
+    }
+    cb(q_cur, "step35_indexer_q_cat", il);
+
+    // ---- z/w projections (roles land in Slice 3: z ↔ csa_block_compress (z_norm_type=none),
+    // w ≡ fork DSA per-head indexer weights) ----
+    ggml_tensor * z_cur = ggml_mul_mat(ctx0, layer.indexer_z, inpL); // {head_size, n_tokens}
+    cb(z_cur, "step35_indexer_z_raw", il);
+
+    ggml_tensor * w_cur = ggml_mul_mat(ctx0, layer.indexer_w, inpL); // {n_ihead, n_tokens}
+    w_cur = ggml_scale(ctx0, w_cur, 1.0f / sqrtf(float(head_size * n_ihead))); // DSA :488 port
+    cb(w_cur, "step35_indexer_w", il);
+
+    // ---- read back the cached RAW proxy keys ({head_size, n_kv}), rope pe at read-back ----
+    ggml_tensor * cached_k = ggml_view_2d(ctx0, kr_cache, head_size, n_kv,
+            ggml_row_size(kr_cache->type, head_size), 0);
+    ggml_tensor * k_f32 = ggml_cast(ctx0, ggml_cont(ctx0, cached_k), GGML_TYPE_F32);
+    cb(k_f32, "step35_indexer_cached_k", il);
+
+    ggml_tensor * k_pe = ggml_view_3d(ctx0, k_f32, rope_dim, 1, n_kv,
+            ggml_row_size(k_f32->type, head_size),
+            ggml_row_size(k_f32->type, head_size), 0);
+    k_pe = ggml_rope_ext(ctx0, k_pe, lctx.inp_kv_pos, nullptr, rope_dim,
+            rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+    ggml_tensor * indexer_k_b;
+    if (nope_dim > 0) {
+        ggml_tensor * k_nope = ggml_view_3d(ctx0, k_f32, nope_dim, 1, n_kv,
+                ggml_row_size(k_f32->type, head_size),
+                ggml_row_size(k_f32->type, head_size),
+                ggml_row_size(k_f32->type, rope_dim));
+        indexer_k_b = ggml_concat(ctx0, k_pe, k_nope, 0);
+    } else {
+        indexer_k_b = k_pe;
+    }
+    indexer_k_b = ggml_reshape_3d(ctx0, indexer_k_b, head_size, n_kv, 1);
+    cb(indexer_k_b, "step35_indexer_k_rope", il);
+
+    // ---- scores: relu(q·k)·w summed over proxy heads, seeded with the causal mask ----
+    // Non-inplace add on purpose: the F32 mask seeds aliases inp_KQ_mask (-fa 0), which later
+    // softmax layers read back (build_deepseek2.cpp:540 caveat).
+    ggml_tensor * indexer_score = ggml_view_2d(ctx0, KQ_mask, n_kv, n_tokens, KQ_mask->nb[1], 0);
+    if (indexer_score->type != GGML_TYPE_F32) {
+        indexer_score = ggml_cast(ctx0, indexer_score, GGML_TYPE_F32);
+        cb(indexer_score, "step35_indexer_score_mask_f32", il);
+    }
+
+    ggml_tensor * q2d = ggml_reshape_2d(ctx0, q_cur, head_size, n_ihead * n_tokens);
+    ggml_tensor * indexer_kq = ggml_mul_mat(ctx0, indexer_k_b, q2d); // {n_kv, n_ihead*n_tokens}
+    cb(indexer_kq, "step35_indexer_kq", il);
+    indexer_kq = ggml_relu(ctx0, indexer_kq);
+    cb(indexer_kq, "step35_indexer_kq_relu", il);
+    indexer_kq = ggml_reshape_3d(ctx0, indexer_kq, n_kv, n_ihead, n_tokens);
+    indexer_kq = ggml_cont(ctx0, ggml_transpose(ctx0, indexer_kq)); // {n_ihead, n_kv, n_tokens}
+    ggml_tensor * w3 = ggml_reshape_3d(ctx0, w_cur, n_ihead, 1, n_tokens);
+    indexer_kq = ggml_mul(ctx0, indexer_kq, w3);
+    cb(indexer_kq, "step35_indexer_kq_w", il);
+    ggml_tensor * score = ggml_sum_rows(ctx0, indexer_kq); // {1, n_kv, n_tokens}
+    score = ggml_reshape_2d(ctx0, score, n_kv, n_tokens);
+    indexer_score = ggml_add(ctx0, indexer_score, score);
+    cb(indexer_score, "step35_indexer_score", il);
+    ggml_build_forward_expand(gf, indexer_score);
 }
 
 ggml_cgraph * llm_build_context::build_step35() {
@@ -119,8 +253,10 @@ ggml_cgraph * llm_build_context::build_step35() {
         }
         auto rope_freqs = layer.rope_freqs;
         layer.rope_freqs = nullptr;
-        // Slice 1 plumbing: proxy-key cache write scaffold (semantics-free placeholder source)
+        // Slice 1/2 plumbing: proxy-key cache write (real proxy key: k_norm(k_proj), RAW) +
+        // read-back scoring telemetry (semantic selection core deferred to Slice 3 knobs).
         build_step35_indexer_kv_write(gf, il, inpL);
+        build_step35_indexer_score(gf, il, inpL, inp_pos, KQ_mask);
         cur = build_std_attention(gf, model.layers[il].attn_norm, inpL,
                 inp_pos, il == n_layer_base - 1 && n_tokens > 1 && !cparams.mtp ? inp_out_ids : nullptr,
                 rope_factors, is_swa ? KQ_mask_swa : KQ_mask, nullptr, nullptr, kq_scale, 0.0f, is_swa ? hparams.n_swa : 0,
