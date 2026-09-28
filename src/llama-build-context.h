@@ -445,6 +445,10 @@ struct llm_build_context {
 
     ggml_cgraph * build_step35();
 
+    // Slice 1 indexer KV plumbing (semantics-free): proxy-key cache write scaffold +
+    // dsa_cache_copies graph-reuse registration for STEP35 full-attn layers.
+    void build_step35_indexer_kv_write(ggml_cgraph * gf, int il, ggml_tensor * inpL);
+
     ggml_tensor * build_step35_mtp(
             const llama_layer & mtp_layer,
             ggml_tensor * hidden_states_from_main_model,

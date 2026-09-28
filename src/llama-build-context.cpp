@@ -217,6 +217,13 @@ ggml_cgraph * llm_build_context::build_k_shift() {
         ggml_build_forward_expand(gf, tmp);
     }
 
+    // Step-5 sparse GQA indexer (STEP35) proxy-key cache: Slice 1 stores RAW proxy keys in
+    // kv_self.kr_l (no RoPE folded at write), so a K-shift changes cell positions but not the
+    // cached rows -- they copy through untouched (verified by the harness shift test). If a
+    // later slice folds RoPE into the cached key at write time (pe/nope split over
+    // indexer_rope_dim), this is where the matching pe delta-rotation must go: mirror the
+    // GLM-DSA block below minus the Hadamard, or RoPE at read-back instead and stay here.
+
     // DSA lightning-indexer key cache (GLM-5.2 / DeepSeek-V3.2): the persistent indexer keys in
     // kv_self.kr_l[il] are RoPE-position-encoded at write time (build_deepseek2_dsa_indexer rotates
     // the first rope_dim dims with the cell's absolute pos), so a context-shift that re-RoPEs the
@@ -373,7 +380,12 @@ ggml_cgraph * llm_build_context::build_defrag(const std::vector<uint32_t> & ids)
             if (llm_arch_is_hybrid(model.arch) && hparams.is_recurrent(il)) {
                 continue;
             }
-            if (kv_self.k_l[il] == nullptr) {
+            // KV arrays exclude the MTP tail (llama_kv_cache_init sizes them
+            // model.mtp ? n_layer : n_layer - nextn_predict_layers), but this context's
+            // n_layer is hparams.n_layer (full, incl. MTP). Bound by the arrays or an
+            // MTP-tail index reads k_l out of bounds -> garbage tensor -> segfault in
+            // ggml_view_2d (caught by the _kr_plumb_test T4 defrag crash).
+            if ((size_t) il >= kv_self.k_l.size() || kv_self.k_l[il] == nullptr) {
                 continue;
             }
             const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);

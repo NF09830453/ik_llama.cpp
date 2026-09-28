@@ -2660,6 +2660,12 @@ size_t llama_model::cache_size(int il, ggml_type type_k, ggml_type type_v, ggml_
         const uint32_t ratio = hparams.dsv4_compress_ratios[il];
         k_size += ggml_row_size(idx_type_k, hparams.indexer_head_size) * (rows + (rows + ratio - 1)/ratio);
     }
+    // Step-5 sparse GQA indexer (STEP35): full-attn layers cache one raw proxy indexer key
+    // per cell (idx_type_k rows of indexer_head_size). Mirrors the kr_l allocation in
+    // llama_kv_cache_init(); MTP tail layers carry no indexer tensors (indexer_is_full == false).
+    if (arch == LLM_ARCH_STEP35 && hparams.indexer_head_size > 0 && hparams.indexer_is_full[il]) {
+        k_size += ggml_row_size(idx_type_k, hparams.indexer_head_size) * rows;
+    }
     // a PLE layer that is not recurrent still gets a state row for its convolution history
     if (hparams.n_embd_ple_conv(il) > 0) {
         auto state_sots = std::min<uint32_t>(std::max<uint32_t>(1, n_seq_max), kv_size);

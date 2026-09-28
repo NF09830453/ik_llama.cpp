@@ -2,10 +2,63 @@
 #include "../llama-model.h"
 #include "../llama-context.h"
 
+// Step-5 sparse GQA indexer: persistent proxy-key cache plumbing (Slice 1, SEMANTICS-FREE).
+//
+// kv_self.kr_l[il] ([indexer_head_size == proxy_dim, kv_size], idx_type_k) holds one proxy
+// indexer key per cached cell on FULL-attn layers only (SWA layers carry no indexer). Slice 1
+// wires storage + maintenance only:
+//   - write:  one ggml_cpy per graph, rows kv_head..kv_head+n_tokens, registered in
+//             lctx.dsa_cache_copies so llama_context::update_cache_copies() re-points the
+//             baked view_offs when a graph is reused (GLM-DSA dsa_cache_copies pattern).
+//             Without that registration a reused decode graph keeps scattering this ubatch's
+//             keys into the first ubatch's slot.
+//   - defrag: rows follow their cells (generic kr_l block in llm_build_context::build_defrag).
+//   - shift:  rows carry NO position encoding yet, so a K-shift leaves them untouched --
+//             "copy-through" by construction (see llm_build_context::build_k_shift()).
+//
+// The WRITE SOURCE is deliberately semantics-free: the first indexer_head_size dims of this
+// layer's input hidden state, cast to idx_type_k. It is deterministic per (layer, token), so
+// plumbing tests can discriminate cache slots, and Slice 2 replaces it with the real proxy
+// key (q/k proj + q_norm/k_norm + rope pe/nope split) behind this same cpy/register machinery.
+// If Slice 2 folds RoPE into the cached key at write time it MUST also extend build_k_shift()
+// with the matching pe delta-rotation (GLM-DSA precedent); caching the raw key and RoPE-ing at
+// read-back keeps the shift invariant above intact instead.
+void llm_build_context::build_step35_indexer_kv_write(ggml_cgraph * gf, int il, ggml_tensor * inpL) {
+    const int64_t head_size = hparams.indexer_head_size;
+
+    ggml_tensor * kr_cache = (size_t) il < kv_self.kr_l.size() ? kv_self.kr_l[il] : nullptr;
+    if (!kr_cache || !hparams.indexer_is_full[il]) {
+        return;
+    }
+    GGML_ASSERT(head_size > 0 && head_size <= inpL->ne[0]);
+
+    ggml_tensor * src = ggml_view_2d(ctx0, inpL, head_size, n_tokens, inpL->nb[1], 0);
+    src = ggml_cast(ctx0, ggml_cont(ctx0, src), kr_cache->type);
+    cb(src, "step35_kr_plumb_src", il);
+
+    ggml_tensor * kr_view = ggml_view_2d(ctx0, kr_cache, head_size, n_tokens,
+            ggml_row_size(kr_cache->type, head_size),
+            ggml_row_size(kr_cache->type, head_size) * kv_head);
+    ggml_tensor * kr_cpy = ggml_cpy(ctx0, src, kr_view);
+    cb(kr_cpy, "step35_kr_plumb_write", il);
+
+    // graph-reuse fixup registration (dsa_cache_copies pattern): kr_view bakes kv_head at
+    // build time; update_cache_copies() patches view_offs = kv_head*nb[1] on graph reuse.
+    GGML_ASSERT((size_t) il < lctx.dsa_cache_copies.size());
+    lctx.dsa_cache_copies[il].cpy  = kr_cpy;
+    lctx.dsa_cache_copies[il].step = kr_cache->nb[1];
+
+    ggml_build_forward_expand(gf, kr_cpy);
+}
+
 ggml_cgraph * llm_build_context::build_step35() {
     ggml_cgraph * gf = new_graph_custom();
     ggml_tensor * cur;
     auto inp_pos     = build_inp_pos();
+
+    // indexer-write registrations are per-graph: stale entries from a previous build must not
+    // be patched against a graph that no longer contains them (build_openpangu.cpp precedent).
+    std::fill(lctx.dsa_cache_copies.begin(), lctx.dsa_cache_copies.end(), llama_context::CacheCopy{});
 
     if (cparams.mtp_op_type != MTP_OP_NONE) {
         GGML_ASSERT(model.mtp && hparams.nextn_predict_layers > 0);
@@ -66,6 +119,8 @@ ggml_cgraph * llm_build_context::build_step35() {
         }
         auto rope_freqs = layer.rope_freqs;
         layer.rope_freqs = nullptr;
+        // Slice 1 plumbing: proxy-key cache write scaffold (semantics-free placeholder source)
+        build_step35_indexer_kv_write(gf, il, inpL);
         cur = build_std_attention(gf, model.layers[il].attn_norm, inpL,
                 inp_pos, il == n_layer_base - 1 && n_tokens > 1 && !cparams.mtp ? inp_out_ids : nullptr,
                 rope_factors, is_swa ? KQ_mask_swa : KQ_mask, nullptr, nullptr, kq_scale, 0.0f, is_swa ? hparams.n_swa : 0,

@@ -1354,7 +1354,11 @@ static bool llama_kv_cache_init(
     // pooling precedes the norm and the rotation that the other two arches fold in before caching.
     const bool has_qwen4exp_indexer =
         model.arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0;
-    if (has_glm_dsa_indexer || has_openpangu_dsa_indexer || has_qwen4exp_indexer) {
+    // Step-5 sparse GQA indexer (STEP35): one raw proxy key per cached cell, full-attn
+    // layers only (SWA layers carry no indexer tensors).
+    const bool has_step35_indexer =
+        model.arch == LLM_ARCH_STEP35 && hparams.indexer_head_size > 0;
+    if (has_glm_dsa_indexer || has_openpangu_dsa_indexer || has_qwen4exp_indexer || has_step35_indexer) {
         cache.kr_l.resize(n_layer, nullptr);
     }
     if (has_qwen4exp_indexer) {
@@ -1553,6 +1557,15 @@ static bool llama_kv_cache_init(
                         (cache.rows(i) + ratio - 1)/ratio);
                 ggml_format_name(idxp, "cache_kp_l%d", i);
                 cache.kp_l[i] = idxp;
+            }
+
+            // Step-5 sparse GQA indexer (STEP35): the proxy-key cache row per cell, allocated
+            // on full-attn layers only and skipped for the MTP tail (no indexer tensors there).
+            // Mirror of llama_model::cache_size()'s STEP35 branch.
+            if (has_step35_indexer && hparams.indexer_is_full[i] && !is_mtp_tail_layer) {
+                ggml_tensor * idxk = ggml_new_tensor_2d(ctx, idx_type_k, hparams.indexer_head_size, cache.rows(i));
+                ggml_format_name(idxk, "cache_kr_l%d", i);
+                cache.kr_l[i] = idxk;
             }
 
             auto k_name = std::string{"cache_k_l"} + std::to_string(i);
@@ -5099,6 +5112,14 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
             if (!llama_openpangu_validate_latent_cache_types(params.type_k, params.type_v, &error_msg)) {
                 throw std::runtime_error(error_msg);
             }
+            if (!llama_openpangu_validate_indexer_cache_type(params.idx_type_k, &error_msg)) {
+                throw std::runtime_error(error_msg);
+            }
+        }
+        // STEP35 sparse-GQA indexer keys land in an idx_type_k cache row per cell; reject
+        // unsupported -ictk types up front instead of failing at the first ggml_cpy.
+        if (model.arch == LLM_ARCH_STEP35 && model.hparams.indexer_head_size > 0) {
+            std::string error_msg;
             if (!llama_openpangu_validate_indexer_cache_type(params.idx_type_k, &error_msg)) {
                 throw std::runtime_error(error_msg);
             }
