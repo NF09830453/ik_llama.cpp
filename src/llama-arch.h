@@ -511,6 +511,12 @@ enum llm_tensor {
     LLM_TENSOR_MHC_MERGE_BETA,
     LLM_TENSOR_MHC_MERGE_GAMMA,
 
+    // Step-5 sparse-GQA indexer extras (STEP35); q/k/q_norm/k_norm reuse the
+    // LLM_TENSOR_INDEXER_*_PROJ/_NORM enums with per-arch name mappings
+    LLM_TENSOR_INDEXER_Z,
+    LLM_TENSOR_INDEXER_W,
+    LLM_TENSOR_INDEXER_SSMAX_S,
+
     LLM_TENSOR_UNKNOWN,
 };
 

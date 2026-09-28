@@ -1790,6 +1790,36 @@ void llm_load_hparams(
                 hparams.has_rope_freq_base_per_layer = ml.get_key_or_arr(LLM_KV_ROPE_FREQ_BASE_PER_LAYER,
                     hparams.rope_freq_base_per_layer, hparams.n_layer, false);
                 GGML_ASSERT(hparams.has_rope_freq_base_per_layer || have_rfb_train_swa);
+                // Step-5 sparse-GQA indexer (full-attn layers). The converter carries
+                // the tensors but emits no indexer GGUF keys, so derive proxy_dim /
+                // indexer head count from tensor shapes and mirror the HF
+                // sparse_config constants (topk, CSA block size, indexer rope dim).
+                // Absent on dense fallback files (stale Q8_0, mini) -> stays zeroed.
+                {
+                    int il_full = -1;
+                    for (uint32_t il = 0; il < hparams.n_layer_kv_from_start; ++il) {
+                        if (!hparams.swa_layers[il] &&
+                                ml.get_tensor_meta(format("blk.%u.indexer.q.weight", il).c_str()) != nullptr) {
+                            il_full = (int) il;
+                            break;
+                        }
+                    }
+                    if (il_full >= 0) {
+                        const auto * q_norm_meta = ml.get_tensor_meta(format("blk.%d.indexer.q_norm.weight", il_full).c_str());
+                        const auto * w_meta      = ml.get_tensor_meta(format("blk.%d.indexer.w.weight", il_full).c_str());
+                        GGML_ASSERT(q_norm_meta && w_meta);
+                        hparams.indexer_head_size = q_norm_meta->ne[0]; // proxy_dim (256)
+                        hparams.indexer_n_head    = w_meta->ne[1];      // 16 indexer q heads
+                        hparams.indexer_top_k     = 512;                // HF sparse_config.topk
+                        hparams.indexer_rope_dim  = 32;                 // HF sparse_config.sparse_indexer_rope_dim
+                        hparams.indexer_csa_block = 8;                  // HF sparse_config.region_block_size
+                        for (uint32_t il = 0; il < hparams.n_layer_kv_from_start; ++il) {
+                            // full-attn layers carry indexer weights and compute their own top-k
+                            hparams.indexer_is_full[il] = !hparams.swa_layers[il] &&
+                                ml.get_tensor_meta(format("blk.%u.indexer.q.weight", il).c_str()) != nullptr;
+                        }
+                    }
+                }
             } break;
         case LLM_ARCH_LAGUNA:
             {

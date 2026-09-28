@@ -1980,6 +1980,15 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
             {   LLM_TENSOR_NEXTN_HNORM,             "blk.%d.nextn.hnorm" },
             {   LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "blk.%d.nextn.shared_head_head" },
             {   LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "blk.%d.nextn.shared_head_norm" },
+            // Step-5 sparse-GQA indexer (full-attn layers); .k_norm.bias resolves
+            // through the ".bias" suffix of the k_norm entry in llm_tensor_type()
+            {   LLM_TENSOR_INDEXER_Q_PROJ,       "blk.%d.indexer.q" },
+            {   LLM_TENSOR_INDEXER_K_PROJ,       "blk.%d.indexer.k" },
+            {   LLM_TENSOR_INDEXER_Z,            "blk.%d.indexer.z" },
+            {   LLM_TENSOR_INDEXER_W,            "blk.%d.indexer.w" },
+            {   LLM_TENSOR_INDEXER_Q_NORM,       "blk.%d.indexer.q_norm" },
+            {   LLM_TENSOR_INDEXER_K_NORM,       "blk.%d.indexer.k_norm" },
+            {   LLM_TENSOR_INDEXER_SSMAX_S,      "blk.%d.indexer.ssmax_s" },
         },
     },
     {

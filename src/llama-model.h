@@ -421,6 +421,14 @@ struct llama_layer {
     struct ggml_tensor * indexer_k_proj   = nullptr;
     struct ggml_tensor * indexer_q_norm   = nullptr;
 
+    // step35 sparse-GQA indexer (full-attn layers only); norms reuse
+    // indexer_q_norm / indexer_k_norm(_b) from the DSA/QSA blocks above.
+    struct ggml_tensor * indexer_q        = nullptr; // blk.{i}.indexer.q.weight {n_embd, proxy*n_head}
+    struct ggml_tensor * indexer_k        = nullptr; // blk.{i}.indexer.k.weight {n_embd, proxy}
+    struct ggml_tensor * indexer_z        = nullptr; // blk.{i}.indexer.z.weight {n_embd, proxy}
+    struct ggml_tensor * indexer_w        = nullptr; // blk.{i}.indexer.w.weight {n_embd, n_head}
+    struct ggml_tensor * indexer_ssmax_s  = nullptr; // blk.{i}.indexer.ssmax_s  {n_head_q}
+
     // qwen4exp per-layer n-gram embedding (PLE); present on ple layers only
     struct ggml_tensor * ple_key          = nullptr;
     struct ggml_tensor * ple_value        = nullptr;

@@ -1345,18 +1345,26 @@ bool create_tensors_helper::create_step35_tensors(const LLM_TN & tn) {
                     tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), {n_embd}, optional_layer_flags);
         }
 
-        // Step-5 sparse-GQA indexer tensors (full-attention layers only). They are
-        // carried in the GGUF for future sparse-attention support, but the dense
-        // fallback graph never references them. Request-and-skip each tensor by
-        // exact name so the loader's tensor accounting stays exact (per-tensor,
-        // never per-block, to avoid skipping shared trunk tensors).
-        for (const char * part : {"q.weight", "k.weight", "z.weight", "w.weight",
-                                  "q_norm.weight", "k_norm.weight", "k_norm.bias", "ssmax_s"}) {
-            const std::string idx_name = format("blk.%d.indexer.%s", i, part);
-            if (const auto * idx_meta = ml.get_tensor_meta(idx_name.c_str())) {
-                create_tensor(ctx_split, idx_name, {idx_meta->ne[0], idx_meta->ne[1]},
-                        llama_model_loader::TENSOR_SKIP | llama_model_loader::TENSOR_NOT_REQUIRED);
-            }
+        // Step-5 sparse-GQA indexer tensors (full-attention layers only; SWA layers
+        // and dense fallback GGUFs carry none). Contract names: blk.{i}.indexer.
+        // {q,k,z,w,q_norm,k_norm}.weight / .k_norm.bias / .ssmax_s. Shapes mirror HF
+        // sparse_config (proxy_dim=256 / 16 indexer q heads / 1 shared k head,
+        // ssmax_s granularity q_head = one scale per attention q head).
+        // Loaded eagerly (not skip-accounted) so the sparse graph can consume them;
+        // the dense fallback graph still never references them.
+        if (hparams.indexer_n_head > 0 && hparams.indexer_head_size > 0 &&
+                ml.get_tensor_meta(tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", i).c_str()) != nullptr) {
+            const int64_t idx_head   = hparams.indexer_head_size; // proxy_dim (sparse_config.proxy_dim)
+            const int64_t idx_n_head = hparams.indexer_n_head;    // sparse_config.sparse_indexer_num_heads
+            const int idx_flags = optional_layer_flags;
+            layer.indexer_q        = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", i), {n_embd, idx_head * idx_n_head}, idx_flags);
+            layer.indexer_k        = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_K_PROJ, "weight", i), {n_embd, idx_head}, idx_flags);
+            layer.indexer_z        = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_Z, "weight", i), {n_embd, idx_head}, idx_flags);
+            layer.indexer_w        = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_W, "weight", i), {n_embd, idx_n_head}, idx_flags);
+            layer.indexer_q_norm   = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_Q_NORM, "weight", i), {idx_head}, idx_flags);
+            layer.indexer_k_norm   = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_K_NORM, "weight", i), {idx_head}, idx_flags);
+            layer.indexer_k_norm_b = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_K_NORM, "bias", i), {idx_head}, idx_flags);
+            layer.indexer_ssmax_s  = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_SSMAX_S, i), {n_head_l}, idx_flags);
         }
     }
     return use_mmap_buffer;
