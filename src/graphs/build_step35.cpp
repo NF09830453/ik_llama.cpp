@@ -81,6 +81,33 @@ static int ik_csa_mode() {
     GGML_ASSERT(mode >= 0 && mode <= 2 && "IK_CSA: 0=token-grain, 1=pooled-k blocks, 2=z-proj blocks");
     return mode;
 }
+// IK_SSMAX (default 0 = baseline; frozen per process like the knobs above): scalable-softmax
+// per-q-head attention logit scale beta_h = s_h * ln(n) (Nakanishi 2025), s from the loaded
+// blk.{il}.indexer.ssmax_s F32 {n_head} tensor. Granularity settled by tensor contract: ssmax_s
+// is {64} = one scale per ATTENTION q head (the indexer has 16 heads -- a {64} tensor cannot
+// parametrize it), so the scale rides the MAIN attention q, applied post-rope via the existing
+// build_std_attention inp_attn_scale hook (ggml_mul broadcast; FA + non-FA paths both consume
+// the scaled q -- the softmax op itself is untouched, CPU+CUDA parity free). Logits are linear
+// in q, so scaling q per head == scaling logits per head exactly. Applied on FULL attn layers
+// only (sparse_config apply_to_layer_types=[full_attention]; SWA layers carry no indexer).
+// IK_SSMAX=1 BREAKS the G1 dense-equivalence exact-match by design (it changes logits at any
+// ctx) -- gates: oracle L5 q-scale replay + G2/G3 A/B; IK_SSMAX=0 stays the byte-identical
+// regression anchor.
+static bool ik_ssmax_enabled() {
+    static const bool on = getenv("IK_SSMAX") != nullptr && atoi(getenv("IK_SSMAX")) != 0;
+    return on;
+}
+// n source for beta = s*ln(n): 0 = ln(n_ctx) (DEFAULT -- global context regime, LogN-trick
+// precedent: stable across decode so imatrix/G2/G3 see one consistent attention behaviour);
+// 1 = ln(padded n_kv) (per-build constant -- pad 32/256 quantizes the drift; counts non-real
+// positions at small ctx); 2 = used-span (Nakanishi-literal competition size) DEFERRED: needs
+// a per-step graph input (inp_kv_pos precedent) and makes every downstream gate a moving
+// target -- revisit only if G3 discriminates.
+static int ik_ssmax_n_mode() {
+    static const int mode = getenv("IK_SSMAX_N") ? atoi(getenv("IK_SSMAX_N")) : 0;
+    GGML_ASSERT(mode >= 0 && mode <= 1 && "IK_SSMAX_N: 0=ln(n_ctx), 1=ln(padded n_kv); 2 (used-span) deferred");
+    return mode;
+}
 
 void llm_build_context::build_step35_indexer_kv_write(ggml_cgraph * gf, int il, ggml_tensor * inpL) {
     const int64_t head_size = hparams.indexer_head_size;
@@ -436,9 +463,30 @@ ggml_cgraph * llm_build_context::build_step35() {
             }
             attn_mask = sparse;
         }
+        // IK_SSMAX per-q-head logit scale beta_h = s_h * ln(n): ssmax_s {n_head} reshaped to
+        // {1, n_head, 1} broadcasts along Qcur's head axis (Qcur is {hd, n_head, n_tokens} at
+        // the inp_attn_scale mul site) -- scale * ln(n) folded into one ggml_scale on the
+        // weight view, no graph input, no new ops. Consumed by build_std_attention's existing
+        // `Qcur = ggml_mul(Qcur, inp_attn_scale)` (post-rope: rope is orthogonal per pair so a
+        // per-head scalar commutes -- scaling q post-rope == scaling logits).
+        ggml_tensor * ssmax_scale = nullptr;
+        if (!is_swa && ik_ssmax_enabled()) {
+            const auto & slayer = model.layers[il];
+            GGML_ASSERT(slayer.indexer_ssmax_s && "IK_SSMAX=1 needs blk.{i}.indexer.ssmax_s");
+            GGML_ASSERT(slayer.indexer_ssmax_s->ne[0] == hparams.n_head(il));
+            const float n_src = ik_ssmax_n_mode() == 0 ? float(cparams.n_ctx) : float(n_kv);
+            const float beta  = logf(n_src);
+            ggml_tensor * s3 = ggml_reshape_3d(ctx0, slayer.indexer_ssmax_s, 1, hparams.n_head(il), 1);
+            // ggml_cont: the scale chain derives from a MODEL WEIGHT (mmap/split buffer) -- without
+            // the copy the tap's data pointer is not compute-buffer storage, and the harness
+            // cb_eval grab segfaulted reading it (first tap ever captured outside the compute
+            // buffer). The cont also gives the downstream mul a contiguous src1.
+            ssmax_scale = ggml_cont(ctx0, ggml_scale(ctx0, s3, beta));
+            cb(ssmax_scale, "step35_ssmax_qscale", il);
+        }
         cur = build_std_attention(gf, model.layers[il].attn_norm, inpL,
                 inp_pos, il == n_layer_base - 1 && n_tokens > 1 && !cparams.mtp ? inp_out_ids : nullptr,
-                rope_factors, attn_mask, nullptr, nullptr, kq_scale, 0.0f, is_swa ? hparams.n_swa : 0,
+                rope_factors, attn_mask, nullptr, ssmax_scale, kq_scale, 0.0f, is_swa ? hparams.n_swa : 0,
                 il, true, false, true);
         layer.rope_freqs = rope_freqs;
 
