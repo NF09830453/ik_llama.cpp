@@ -20645,10 +20645,9 @@ static void ggml_compute_forward_clamp_f32(
 
     const struct ggml_tensor * src0 = dst->src[0];
 
-    if (params->ith != 0) {
-        return;
-    }
-
+    // NOTE: no `ith != 0` early return here -- combined with the strided loop below it
+    // would clamp only thread 0's rows (j = ith, ith+nth, ...) and silently skip the rest
+    // (found via the STEP35 CSA den clamp: NaN block_k under n_threads > 1).
     float min;
     float max;
     memcpy(&min, (float *) dst->op_params + 0, sizeof(float));

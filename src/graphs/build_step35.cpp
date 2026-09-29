@@ -53,6 +53,34 @@ static bool ik_sparse_enabled() {
     static const bool on = getenv("IK_SPARSE") != nullptr && atoi(getenv("IK_SPARSE")) != 0;
     return on;
 }
+// IK_CSA (default 0 = token-grain baseline; frozen per process like the knobs above): Stage B
+// CSA block-compress candidate (block size B = hparams.indexer_csa_block, HF region_block_size=8).
+// IK_CSA>0 pools cached proxy keys into slot-aligned blocks of B and scores BLOCK-grain (score of
+// the pooled key broadcast to every slot of its block); the IK_SPARSE selection machinery downstream
+// is untouched -- broadcast scores tie within a block, argsort groups ties contiguously, and the
+// rank cutoff at multiples of B therefore snaps to WHOLE blocks (the doc's "top-M blocks, M=topk/B").
+// WHAT gets pooled is THE open semantic question (no public modeling code -- derivation ladder in
+// AGENTS.md), hence two ranked candidates:
+//   IK_CSA=1 "pooling": block key = validity-weighted mean of the cached proxy keys (doc psi).
+//            Pooling runs AFTER the read-back pe RoPE (position-resolved keys pooled per block).
+//   IK_CSA=2 "z proj":  block key = validity-weighted mean of z_proj(inpL) rows -- z_t is
+//            per-token HISTORY, so this candidate swaps the kv_write cache source to RAW z rows
+//            (csa_z_norm_type="none" literally: the z output is NOT normalized -- matched exactly
+//            by caching ggml_mul_mat(indexer_z, inpL) with no k_norm) and pools those instead.
+//            k_norm(k_proj) is UNUSED in this mode -- a candidate semantic ranked by the tensor
+//            contract (z.shape == k.shape, z_norm_type="none") over doc silence about z.
+// Partial blocks divide by |Omega_b| (doc prose rule; the /B variant stays deferred). Slot-aligned
+// grouping == position-aligned in steady single-sequence decode; multi-sequence/defrag alignment
+// is a documented TODO. Pooling EXCLUDES non-visible kv slots (n_kv is the PADDED span -- empty
+// cells carry allocator-garbage kr_l rows; unweighted pooling poisons block means with REAL values)
+// via validity weights derived from the causal mask. IK_SPARSE=0 + IK_CSA>0 = telemetry-only
+// block taps (oracle/G4); G1 dense-equivalence holds under every IK_CSA mode (ctx <= topk clamp
+// zeroes every rank penalty regardless of score values).
+static int ik_csa_mode() {
+    static const int mode = getenv("IK_CSA") ? atoi(getenv("IK_CSA")) : 0;
+    GGML_ASSERT(mode >= 0 && mode <= 2 && "IK_CSA: 0=token-grain, 1=pooled-k blocks, 2=z-proj blocks");
+    return mode;
+}
 
 void llm_build_context::build_step35_indexer_kv_write(ggml_cgraph * gf, int il, ggml_tensor * inpL) {
     const int64_t head_size = hparams.indexer_head_size;
@@ -65,10 +93,19 @@ void llm_build_context::build_step35_indexer_kv_write(ggml_cgraph * gf, int il, 
 
     // Slice 2: real proxy key = k_norm(k_proj(inpL)) over proxy_dim, cached RAW (no RoPE).
     // Ported inline from build_deepseek2_dsa_indexer (build_deepseek2.cpp:417).
+    // IK_CSA=2 "z proj" candidate swaps the cached source to RAW z_proj(inpL) (csa_z_norm_type=
+    // "none": z output NOT normalized -- deliberately NO k_norm here); whitening below still
+    // applies (orthonormal => plumbing-neutral precision win under either knob).
     const auto & layer = model.layers[il];
-    GGML_ASSERT(layer.indexer_k && layer.indexer_k_norm && "STEP35 indexer k tensors missing");
-    ggml_tensor * src = ggml_mul_mat(ctx0, layer.indexer_k, inpL); // {head_size, n_tokens}
-    src = llm_build_norm(ctx0, src, hparams, layer.indexer_k_norm, layer.indexer_k_norm_b, LLM_NORM, cb, il);
+    ggml_tensor * src;
+    if (ik_csa_mode() == 2) {
+        GGML_ASSERT(layer.indexer_z && "STEP35 indexer z tensor missing (IK_CSA=2)");
+        src = ggml_mul_mat(ctx0, layer.indexer_z, inpL); // {head_size, n_tokens}
+    } else {
+        GGML_ASSERT(layer.indexer_k && layer.indexer_k_norm && "STEP35 indexer k tensors missing");
+        src = ggml_mul_mat(ctx0, layer.indexer_k, inpL); // {head_size, n_tokens}
+        src = llm_build_norm(ctx0, src, hparams, layer.indexer_k_norm, layer.indexer_k_norm_b, LLM_NORM, cb, il);
+    }
     cb(src, "step35_indexer_k_raw", il);
     GGML_ASSERT(src->ne[0] == head_size && src->ne[1] == n_tokens);
 
@@ -220,28 +257,85 @@ ggml_tensor * llm_build_context::build_step35_indexer_score(ggml_cgraph * gf, in
     indexer_k_b = ggml_reshape_3d(ctx0, indexer_k_b, head_size, n_kv, 1);
     cb(indexer_k_b, "step35_indexer_k_rope", il);
 
-    // ---- scores: relu(q·k)·w summed over proxy heads, seeded with the causal mask ----
-    // Non-inplace add on purpose: the F32 mask seeds aliases inp_KQ_mask (-fa 0), which later
-    // softmax layers read back (build_deepseek2.cpp:540 caveat).
-    ggml_tensor * indexer_score = ggml_view_2d(ctx0, KQ_mask, n_kv, n_tokens, KQ_mask->nb[1], 0);
-    if (indexer_score->type != GGML_TYPE_F32) {
-        indexer_score = ggml_cast(ctx0, indexer_score, GGML_TYPE_F32);
-        cb(indexer_score, "step35_indexer_score_mask_f32", il);
+    // ---- scores: relu(q·k)·w summed over proxy heads (DSA :488 port) ----
+    // IK_CSA=0 scores TOKEN keys (n_kv); IK_CSA>0 scores pooled BLOCK keys (n_kv/B) and
+    // broadcasts per-block scores back to slots. The causal mask seed is added LAST at slot
+    // granularity in both cases. Non-inplace add on purpose: the F32 mask seed aliases
+    // inp_KQ_mask (-fa 0), which later softmax layers read back (build_deepseek2.cpp:540 caveat).
+    ggml_tensor * mask_f32 = ggml_view_2d(ctx0, KQ_mask, n_kv, n_tokens, KQ_mask->nb[1], 0);
+    if (mask_f32->type != GGML_TYPE_F32) {
+        mask_f32 = ggml_cast(ctx0, mask_f32, GGML_TYPE_F32);
+        cb(mask_f32, "step35_indexer_score_mask_f32", il);
     }
 
-    ggml_tensor * q2d = ggml_reshape_2d(ctx0, q_cur, head_size, n_ihead * n_tokens);
-    ggml_tensor * indexer_kq = ggml_mul_mat(ctx0, indexer_k_b, q2d); // {n_kv, n_ihead*n_tokens}
-    cb(indexer_kq, "step35_indexer_kq", il);
-    indexer_kq = ggml_relu(ctx0, indexer_kq);
-    cb(indexer_kq, "step35_indexer_kq_relu", il);
-    indexer_kq = ggml_reshape_3d(ctx0, indexer_kq, n_kv, n_ihead, n_tokens);
-    indexer_kq = ggml_cont(ctx0, ggml_transpose(ctx0, indexer_kq)); // {n_ihead, n_kv, n_tokens}
-    ggml_tensor * w3 = ggml_reshape_3d(ctx0, w_cur, n_ihead, 1, n_tokens);
-    indexer_kq = ggml_mul(ctx0, indexer_kq, w3);
-    cb(indexer_kq, "step35_indexer_kq_w", il);
-    ggml_tensor * score = ggml_sum_rows(ctx0, indexer_kq); // {1, n_kv, n_tokens}
-    score = ggml_reshape_2d(ctx0, score, n_kv, n_tokens);
-    indexer_score = ggml_add(ctx0, indexer_score, score);
+    // scoring chain reused VERBATIM for token keys or pooled block keys (n_key = n_kv / n_blocks)
+    auto score_chain = [&](ggml_tensor * keys, int64_t n_key) {
+        ggml_tensor * q2d = ggml_reshape_2d(ctx0, q_cur, head_size, n_ihead * n_tokens);
+        ggml_tensor * kq = ggml_mul_mat(ctx0, keys, q2d); // {n_key, n_ihead*n_tokens}
+        cb(kq, "step35_indexer_kq", il);
+        kq = ggml_relu(ctx0, kq);
+        cb(kq, "step35_indexer_kq_relu", il);
+        kq = ggml_reshape_3d(ctx0, kq, n_key, n_ihead, n_tokens);
+        kq = ggml_cont(ctx0, ggml_transpose(ctx0, kq)); // {n_ihead, n_key, n_tokens}
+        ggml_tensor * w3 = ggml_reshape_3d(ctx0, w_cur, n_ihead, 1, n_tokens);
+        kq = ggml_mul(ctx0, kq, w3);
+        cb(kq, "step35_indexer_kq_w", il);
+        ggml_tensor * s = ggml_sum_rows(ctx0, kq); // {1, n_key, n_tokens}
+        return ggml_reshape_2d(ctx0, s, n_key, n_tokens);
+    };
+
+    ggml_tensor * slot_score;
+    const int64_t B = hparams.indexer_csa_block > 0 ? hparams.indexer_csa_block : 8;
+    if (ik_csa_mode() == 0) {
+        slot_score = score_chain(ggml_reshape_2d(ctx0, indexer_k_b, head_size, n_kv), n_kv);
+    } else {
+        // kv padding (32 non-FA / 256 FA) guarantees n_kv % B == 0 for B=8 -- slot-aligned reshape
+        // pooling needs contiguous b*B..b*B+B-1 groups (== position-aligned blocks in steady
+        // single-sequence decode; multi-sequence/defrag alignment TODO).
+        GGML_ASSERT(B > 0 && n_kv % B == 0 && "CSA slot-aligned blocks need n_kv divisible by B");
+        const int64_t n_blocks = n_kv / B;
+
+        // validity weights v[slot] = 1 iff visible to SOME query of this ubatch: step(mask+0.5)
+        // per (slot,query) turns {0,-inf} into {1,0}, summed over query columns and re-stepped.
+        // Empty padded cells carry allocator garbage kr_l rows -- zero-weighted OUT of the pool
+        // so their garbage cannot poison block means (and 0*garbage stays finite garbage-free 0).
+        ggml_tensor * vis = ggml_step(ctx0, ggml_scale_bias(ctx0, mask_f32, 1.0f, 0.5f));
+        vis = ggml_sum_rows_ext(ctx0, vis, 1);                       // {n_kv, 1}
+        vis = ggml_step(ctx0, ggml_scale_bias(ctx0, vis, 1.0f, -0.5f));
+        vis = ggml_reshape_2d(ctx0, vis, n_kv, 1);
+        cb(vis, "step35_indexer_slot_valid", il);
+        ggml_tensor * v3 = ggml_reshape_3d(ctx0, vis, 1, B, n_blocks);
+
+        // pooling = reshape+sum composition (csa_ssmax.md verdict (d): ggml_pool_1d is CPU-only
+        // in this fork; ggml_sum_rows_ext(dim) has CPU+CUDA parity). slot-aligned reshape
+        // {head, B, n_blocks}: slot b*B+r maps to [*, r, b]. Validity-weighted mean divides by
+        // |Omega_b| (doc prose partial-block rule); den clamp min 1 keeps all-empty blocks finite
+        // (zero key -> zero score -> swallowed by the causal add below).
+        ggml_tensor * k3 = ggml_reshape_3d(ctx0,
+                ggml_reshape_2d(ctx0, indexer_k_b, head_size, n_kv), head_size, B, n_blocks);
+        ggml_tensor * num = ggml_sum_rows_ext(ctx0, ggml_mul(ctx0, k3, v3), 1); // {head, 1, n_blocks}
+        num = ggml_reshape_2d(ctx0, num, head_size, n_blocks);
+        ggml_tensor * den = ggml_sum_rows_ext(ctx0, v3, 1);                      // {1, 1, n_blocks}
+        den = ggml_clamp(ctx0, ggml_reshape_2d(ctx0, den, 1, n_blocks), 1.0f, (float) B);
+        ggml_tensor * block_k = ggml_div(ctx0, num, den); // broadcast {head,n_blocks}/{1,n_blocks}
+        cb(block_k, "step35_indexer_block_k", il);
+
+        ggml_tensor * block_score = score_chain(block_k, n_blocks); // {n_blocks, n_tokens}
+        cb(block_score, "step35_indexer_block_score", il);
+
+        // broadcast to slots: slot b*B+r takes block b's score. repeat alone does it: rep
+        // {B,n_blocks,n_tokens} with rep[r,b,j] = block_score[b,j] flattens col-major to
+        // linear r + B*b (+ B*n_blocks*j) -- reshaped {n_kv,n_tokens} that is exactly slot
+        // i = b*B+r <- block b (the inverse of the pooling reshape's slot map). A permute
+        // here TRANSPOSES the map (slot i <- block i%n_blocks -- bitwise-verified against
+        // the T9 score tap via the oracle L1 broadcast check); it must NOT run.
+        ggml_tensor * bs3 = ggml_reshape_3d(ctx0, block_score, 1, n_blocks, n_tokens);
+        ggml_tensor * rep = ggml_repeat(ctx0, bs3,
+                ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, B, n_blocks, n_tokens));
+        slot_score = ggml_reshape_2d(ctx0, ggml_cont(ctx0, rep), n_kv, n_tokens);
+    }
+
+    ggml_tensor * indexer_score = ggml_add(ctx0, mask_f32, slot_score);
     cb(indexer_score, "step35_indexer_score", il);
     ggml_build_forward_expand(gf, indexer_score);
     return indexer_score;
