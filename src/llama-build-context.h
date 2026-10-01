@@ -392,7 +392,9 @@ struct llm_build_context {
     // Build the additive sparse causal mask from the full score ranking + the base causal KQ_mask.
     ggml_tensor * build_deepseek2_dsa_sparse_mask(
             ggml_tensor * sorted,   // [n_kv, n_tokens] (I32) full descending argsort of scores
-            ggml_tensor * KQ_mask); // F32 causal mask [n_kv, n_tokens_pad]
+            ggml_tensor * KQ_mask,  // F32 causal mask [n_kv, n_tokens_pad]
+            // kept-slot-count override; -1 = hparams.indexer_top_k / cparams.dsa_top_k as before
+            int64_t n_top_k_override = -1);
 
     // Adapt the (F32, unpadded) sparse mask to the shape/dtype ggml_flash_attn_ext requires on this
     // fork: F16, contiguous, ne[1] padded to GGML_KQ_MASK_PAD (== the dense KQ_mask's padded shape).

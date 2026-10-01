@@ -81,6 +81,20 @@ static int ik_csa_mode() {
     GGML_ASSERT(mode >= 0 && mode <= 2 && "IK_CSA: 0=token-grain, 1=pooled-k blocks, 2=z-proj blocks");
     return mode;
 }
+// Selection granularity (default 1 = BLOCK grain; frozen per process like the knobs above).
+// Evidence (Oct, G3 needle @ 7.2k ctx): token-grain top-512 (7% keep) loses the needle while
+// dense passes and --dsa-top-k 4096 (57% keep) retrieves it EXACTLY -> HF sparse_config.topk=512
+// counts BLOCKS of region_block_size=8 (512*8 = 4096 kept tokens), consistent with
+// compression_method=csa_block_compress being the architecture, not an option. Block-grain
+// selection = block-pooled scores broadcast to slots (existing verified machinery) + argsort
+// with kept-count topk*B; argsort groups intra-block ties contiguously and topk*B is a multiple
+// of B, so the rank cutoff snaps to WHOLE blocks -- the DSA scatter mask is reused unchanged.
+// IK_SEL_GRAIN=0 keeps the token-grain path as the regression anchor.
+static bool ik_sel_block_grain() {
+    static const int mode = getenv("IK_SEL_GRAIN") ? atoi(getenv("IK_SEL_GRAIN")) : 1;
+    GGML_ASSERT(mode >= 0 && mode <= 1 && "IK_SEL_GRAIN: 0=token-grain selection, 1=block-grain (default)");
+    return mode != 0;
+}
 // IK_SSMAX (default 0 = baseline; frozen per process like the knobs above): scalable-softmax
 // per-q-head attention logit scale beta_h = s_h * ln(n) (Nakanishi 2025), s from the loaded
 // blk.{il}.indexer.ssmax_s F32 {n_head} tensor. Granularity settled by tensor contract: ssmax_s
@@ -313,7 +327,7 @@ ggml_tensor * llm_build_context::build_step35_indexer_score(ggml_cgraph * gf, in
 
     ggml_tensor * slot_score;
     const int64_t B = hparams.indexer_csa_block > 0 ? hparams.indexer_csa_block : 8;
-    if (ik_csa_mode() == 0) {
+    if (ik_csa_mode() == 0 && !ik_sel_block_grain()) {
         slot_score = score_chain(ggml_reshape_2d(ctx0, indexer_k_b, head_size, n_kv), n_kv);
     } else {
         // kv padding (32 non-FA / 256 FA) guarantees n_kv % B == 0 for B=8 -- slot-aligned reshape
@@ -455,7 +469,14 @@ ggml_cgraph * llm_build_context::build_step35() {
         if (!is_swa && ik_sparse_enabled() && idx_score) {
             ggml_tensor * sorted = ggml_argsort(ctx0, idx_score, GGML_SORT_ORDER_DESC);
             cb(sorted, "step35_indexer_sorted", il);
-            ggml_tensor * sparse = build_deepseek2_dsa_sparse_mask(sorted, KQ_mask);
+            // Block-grain selection: topk counts BLOCKS (sparse_config topk=512 x region_block_size=8
+            // = 4096 kept slots). Kept-count must be a multiple of B so the rank cutoff snaps to
+            // whole blocks (intra-block broadcast scores tie contiguously in the argsort).
+            const int64_t Bsel = hparams.indexer_csa_block > 0 ? hparams.indexer_csa_block : 8;
+            const int64_t kept_slots = ik_sel_block_grain()
+                ? (int64_t) hparams.indexer_top_k * Bsel
+                : (int64_t) hparams.indexer_top_k;
+            ggml_tensor * sparse = build_deepseek2_dsa_sparse_mask(sorted, KQ_mask, kept_slots);
             cb(sparse, "step35_sparse_mask", il); // rename tap for step35 G4 telemetry
             if (flash_attn) {
                 sparse = build_deepseek2_dsa_fa_mask(sparse, KQ_mask);

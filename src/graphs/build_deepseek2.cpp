@@ -627,11 +627,12 @@ ggml_tensor * llm_build_context::build_deepseek2_dsa_indexer(
 // partially-written CUDA destination keeps uninitialized (garbage) rows.
 ggml_tensor * llm_build_context::build_deepseek2_dsa_sparse_mask(
         ggml_tensor * sorted,
-        ggml_tensor * KQ_mask) {
+        ggml_tensor * KQ_mask,
+        int64_t n_top_k_override) {
     const int64_t n_kv_local = KQ_mask->ne[0];
     const int64_t n_tok      = sorted->ne[1];
 
-    int64_t n_top_k = (int64_t) hparams.indexer_top_k;
+    int64_t n_top_k = n_top_k_override >= 0 ? n_top_k_override : (int64_t) hparams.indexer_top_k;
     // Tuning knob: --dsa-top-k (cparams.dsa_top_k) lets us vary the kept-key count to characterize
     // selection quality. <0 means use the model's configured top_k. With the model's configured
     // top_k (2048) on heavily-quantized (IQ2_M) weights the indexer currently under-ranks some
