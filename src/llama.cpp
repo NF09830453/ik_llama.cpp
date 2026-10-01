@@ -1820,6 +1820,10 @@ static void llama_kv_cache_compact_swa(struct llama_context & lctx, uint32_t n_t
     const uint32_t live = cache.live_swa();
     GGML_ASSERT(live >= W && "the retained window must lie inside the live region");
 
+    LLAMA_LOG_DEBUG("%s: SWA compact fired: live %u + n_tokens %u > rows %u (window %u), pos_base %d -> %d\n",
+                   __func__, live, n_tokens, cache.size_swa, W,
+                   cache.pos_base_swa, cache.pos_base_swa + (llama_pos) (live - W));
+
     // llama_graph_compute submits asynchronously and never waits
     ggml_backend_sched_synchronize(lctx.sched);
 
