@@ -2093,6 +2093,11 @@ bool common_speculative_prepare_mtp_runtime(
         gpt_params params_mtp = params_base;
         params_mtp.pooling_type = LLAMA_POOLING_TYPE_NONE;
         params.cparams_dft = common_context_params_to_llama(params_mtp);
+        // Explicit despite the inheritance above: the companion cache must share the
+        // target's compaction layout so tail-only MTP graphs and rewind semantics stay
+        // in lockstep (tail layers are never compacted, so compaction is dormant here —
+        // but the allocation win applies and the layouts must not diverge).
+        params.cparams_dft.swa_compress = params_base.swa_compress;
     }
 
     params.cparams_dft.mtp         = true;
@@ -2733,7 +2738,15 @@ bool common_speculative_commit(
         }
     }
 
-    llama_kv_cache_seq_rm(ctx, seq_id, pos_base + (llama_pos) (ids.size() - 1), -1);
+    if (!llama_kv_cache_seq_rm(ctx, seq_id, pos_base + (llama_pos) (ids.size() - 1), -1)) {
+        // Unreachable by construction (the verify decode's own writes create the slack this
+        // trim consumes), but a compacted-cache refusal must never leave ghost rows: fail
+        // the commit loudly so the caller stops the slot instead of continuing corrupted.
+        LOG_ERR("%s: compacted SWA cache refused the post-accept trim at pos %d\n",
+                __func__, (int) (pos_base + (llama_pos) (ids.size() - 1)));
+        common_speculative_checkpoint_discard(ckpt, ctx);
+        return false;
+    }
     common_speculative_checkpoint_discard(ckpt, ctx);
     return true;
 }
@@ -3357,7 +3370,14 @@ int32_t mtp_update_kv_cache(struct llama_context * ctx, const llama_batch& batch
     llama_pos    start_pos = batch.pos[0];
 
     if (llama_kv_cache_seq_pos_max(ctx, seq_id) >= start_pos) {
-        llama_kv_cache_seq_rm(ctx, seq_id, start_pos, -1);
+        // --swa-compress: a compacted cache can refuse this removal right after a compaction
+        // fire (rewind deeper than the regrown slack). Fail loudly; callers degrade the round
+        // (spec feature skipped for the step), the request never aborts.
+        if (!llama_kv_cache_seq_rm(ctx, seq_id, start_pos, -1)) {
+            LOG_ERR("%s: KV cache rewind to pos %d refused (compacted SWA cache); degrading this round\n",
+                    __func__, (int) start_pos);
+            return -1;
+        }
     }
 
     LOG_DBG("[MTP-UPDATE|%s] Updating %d tokens for seq_id %d from pos %d...\n",
