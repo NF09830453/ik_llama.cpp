@@ -432,7 +432,17 @@ ggml_cgraph * llm_build_context::build_step35() {
     auto inpL        = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
     auto inp_out_ids = build_inp_out_ids();
     auto KQ_mask     = build_inp_KQ_mask();
-    auto KQ_mask_swa = build_inp_KQ_mask_swa();
+    // --swa-compress: compacted sliding layers store KV rows in the [sinks|window] layout and
+    // llm_build_kv reads lctx.swa_window_view (set inside build_swa_mask_for_graph) for the kv
+    // view/store head -- MIMO2/DeepSeek4 consumption pattern. All main-loop sliding layers share
+    // one compacted row count (kv-cache assert), so one any_compacted() check picks the mask;
+    // the MTP tail layers are NEVER compacted (llama_kv_layer_rows keeps the nextn tail at
+    // kv_size) and are matched per-layer in build_step35_mtp. Indexer/full-attn layers stay
+    // uncompacted => kr_l rows, inp_kv_pos and the IK_CSA validity/block machinery are
+    // untouched by compaction.
+    auto KQ_mask_swa = kv_self.any_compacted()
+        ? build_swa_mask_for_graph(hparams.n_swa, true)
+        : build_inp_KQ_mask_swa();
     //const float kq_scale = 1.0f / sqrtf(float(n_rot));
     const float kq_scale = 1.0f / sqrtf(float(n_embd_head_k));
 
@@ -590,7 +600,11 @@ ggml_tensor * llm_build_context::build_step35_mtp(
     if ((is_swa && (apply_mask & 0x2)) || (!is_swa && (apply_mask & 0x1))) {
         rope_factors = build_rope_factors(il);
     }
-    auto KQ_mask = is_swa ? build_inp_KQ_mask_swa() : build_inp_KQ_mask();
+    // MTP tail layers are excluded from compaction (llama_kv_layer_rows nextn guard), but keep
+    // the check per-layer so a future layout change stays correct (DeepSeek4 pattern).
+    auto KQ_mask = is_swa
+        ? (kv_self.is_compacted((int) il) ? build_swa_mask_for_graph(hparams.n_swa, true) : build_inp_KQ_mask_swa())
+        : build_inp_KQ_mask();
     const float kq_scale = 1.0f / sqrtf(float(hparams.n_embd_head_k(il)));
 
     cur = build_std_attention(gf, mtp_layer.attn_norm, cur, inp_pos, nullptr,

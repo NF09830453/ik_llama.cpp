@@ -678,7 +678,7 @@ struct llama_model {
     bool supports_swa_compress() const {
         return arch == LLM_ARCH_OPENPANGU || arch == LLM_ARCH_DEEPSEEK4
             || arch == LLM_ARCH_LAGUNA    || arch == LLM_ARCH_GEMMA4
-            || arch == LLM_ARCH_MIMO2
+            || arch == LLM_ARCH_MIMO2     || arch == LLM_ARCH_STEP35
             || supports_dflash_swa_compress() ;
     }
 
