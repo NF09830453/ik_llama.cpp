@@ -743,7 +743,16 @@ bool llama_context::update_cache_copies() {
         }
         return any;
     }
-    const int n_layer = model.mtp && cparams.mtp_op_type != MTP_OP_NONE ?
+    // MTP graphs are tail-only (nextn layers); main layers' cache_copies entries belong to
+    // the last-built MAIN graph and are stale/absent under an MTP op — walking them would
+    // refuse reuse every step (layer-94 null refusal). Bound the walk to the tail range and
+    // skip null entries (tail heads not in the last-built MTP graph, e.g. heads beyond the
+    // active step in a single-head draft-gen build): nothing to patch = nothing to refuse.
+    // Cross-graph staleness is unreachable: mtp_op_type/mtp_step_idx are part of the reuse
+    // fingerprint, so a graph is only ever reused against a build of the same op/step.
+    const bool mtp_graph = model.mtp && cparams.mtp_op_type != MTP_OP_NONE;
+    const int n_layer_base = mtp_graph ? model.hparams.n_layer - model.hparams.nextn_predict_layers : 0;
+    const int n_layer = mtp_graph ?
         model.hparams.n_layer : model.hparams.n_layer - model.hparams.nextn_predict_layers; //cache_copies.size()/2;
     auto layer_has_attention_kv = [&](int il) {
         return !model.hparams.is_recurrent(il);
@@ -757,7 +766,7 @@ bool llama_context::update_cache_copies() {
         printf("%s: !kv_self.v_l.empty() && (int)kv_self.v_l.size() < n_layer\n", __func__);
         return false;
     }
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = n_layer_base; il < n_layer; ++il) {
         if (!layer_has_attention_kv(il) || kv_self.k_l[il] == nullptr) {
             continue;
         }
@@ -775,7 +784,8 @@ bool llama_context::update_cache_copies() {
                 if (!kl->splits[id]) continue;
                 size_t idx = 2*model.splits.size()*il + 2*id + 0;
                 auto& c = cache_copies[idx];
-                if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != kl->splits[id]) {
+                if (!c.cpy) continue; // layer not in the last-built graph: nothing to patch
+                if (c.cpy->op != GGML_OP_CPY || c.cpy->view_src != kl->splits[id]) {
                     return false;
                 }
                 c.cpy->view_offs = cache_head*c.step;
@@ -786,7 +796,8 @@ bool llama_context::update_cache_copies() {
             for (int id = 0; id < vl->n_device; ++id) {
                 if (!vl->splits[id]) continue;
                 auto& c = cache_copies[2*model.splits.size()*il + 2*id + 1];
-                if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != vl->splits[id]) {
+                if (!c.cpy) continue; // layer not in the last-built graph: nothing to patch
+                if (c.cpy->op != GGML_OP_CPY || c.cpy->view_src != vl->splits[id]) {
                     return false;
                 }
                 c.cpy->view_offs = cache_head*c.step;
@@ -795,7 +806,8 @@ bool llama_context::update_cache_copies() {
             }
         } else {
             auto& c = cache_copies[2*il+0];
-            if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != kv_self.k_l[il]) {
+            if (!c.cpy) continue; // layer not in the last-built graph: nothing to patch
+            if (c.cpy->op != GGML_OP_CPY || c.cpy->view_src != kv_self.k_l[il]) {
                 printf("%s: K has no copy or is not a copy in layer %d\n", __func__, il);
                 return false;
             }
@@ -804,7 +816,8 @@ bool llama_context::update_cache_copies() {
             c.cpy->data = c.cpy->src[1]->data;
             if (!kv_self.v_l.empty() && kv_self.v_l[il]) {
                 auto& c = cache_copies[2*il+1];
-                if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != kv_self.v_l[il]) {
+                if (!c.cpy) continue; // layer not in the last-built graph: nothing to patch
+                if (c.cpy->op != GGML_OP_CPY || c.cpy->view_src != kv_self.v_l[il]) {
                     printf("%s: V has no copy or is not a copy in layer %d\n", __func__, il);
                     return false;
                 }
@@ -1818,16 +1831,24 @@ static void llama_kv_cache_compact_swa(struct llama_context & lctx, uint32_t n_t
     }
 
     const uint32_t live = cache.live_swa();
-    GGML_ASSERT(live >= W && "the retained window must lie inside the live region");
+    // Generalized retention: keep min(W, live) rows. live >= W reproduces the old
+    // window-exact arithmetic byte-for-byte; live < W (reachable under MTP spec rewind
+    // right after a fire) is a clean no-op instead of an assert abort.
+    const uint32_t n_keep = std::min(W, live);
+    const uint32_t drop   = live - n_keep;
+    if (drop == 0) {
+        return;
+    }
 
-    LLAMA_LOG_DEBUG("%s: SWA compact fired: live %u + n_tokens %u > rows %u (window %u), pos_base %d -> %d\n",
-                   __func__, live, n_tokens, cache.size_swa, W,
-                   cache.pos_base_swa, cache.pos_base_swa + (llama_pos) (live - W));
+    LLAMA_LOG_DEBUG("%s: SWA compact fired: live %u + n_tokens %u > rows %u (window %u), "
+                   "keeping %u, dropping %u, pos_base %d -> %d\n",
+                   __func__, live, n_tokens, cache.size_swa, W, n_keep, drop,
+                   cache.pos_base_swa, cache.pos_base_swa + (llama_pos) drop);
 
     // llama_graph_compute submits asynchronously and never waits
     ggml_backend_sched_synchronize(lctx.sched);
 
-    const uint32_t src_row = cache.sink_rows + live - W;
+    const uint32_t src_row = cache.sink_rows + drop;
     const uint32_t dst_row = cache.sink_rows;
 
     auto copy_bytes = [&](ggml_tensor * tensor, size_t src_offset, size_t dst_offset, size_t nbytes) {
@@ -1846,7 +1867,7 @@ static void llama_kv_cache_compact_swa(struct llama_context & lctx, uint32_t n_t
         // kl rows are position-major: kl->ne[1]/rows(il) rows per position (n_head_kv)
         const size_t rows_per_pos = (size_t) kl->ne[1] / cache.rows((int) il);
         const size_t stride = kl->nb[1] * rows_per_pos;
-        copy_bytes(kl, (size_t) src_row*stride, (size_t) dst_row*stride, (size_t) W*stride);
+        copy_bytes(kl, (size_t) src_row*stride, (size_t) dst_row*stride, (size_t) n_keep*stride);
 
         // K-only layouts push nothing to v_l, so it is empty rather than null-filled
         ggml_tensor * vl = il < cache.v_l.size() ? cache.v_l[il] : nullptr;
@@ -1857,7 +1878,7 @@ static void llama_kv_cache_compact_swa(struct llama_context & lctx, uint32_t n_t
         const int32_t n_embd_v_row = llama_kv_v_row_embd(lctx.model, lctx.model.hparams, il);
         if (!cache.v_trans) {
             const size_t v_stride = ggml_row_size(vl->type, n_embd_v_row);
-            copy_bytes(vl, (size_t) src_row*v_stride, (size_t) dst_row*v_stride, (size_t) W*v_stride);
+            copy_bytes(vl, (size_t) src_row*v_stride, (size_t) dst_row*v_stride, (size_t) n_keep*v_stride);
         } else {
             // transposed V is position-minor, so one position is a column, not a row
             const size_t v_size_el = ggml_type_size(vl->type);
@@ -1869,14 +1890,14 @@ static void llama_kv_cache_compact_swa(struct llama_context & lctx, uint32_t n_t
             ggml_backend_tensor_get(vl, scratch.data(), 0, nbytes);
             for (int32_t j = 0; j < n_embd_v_row; ++j) {
                 uint8_t * row = scratch.data() + (size_t) j*v_rows*v_size_el;
-                memmove(row + (size_t) dst_row*v_size_el, row + (size_t) src_row*v_size_el, (size_t) W*v_size_el);
+                memmove(row + (size_t) dst_row*v_size_el, row + (size_t) src_row*v_size_el, (size_t) n_keep*v_size_el);
             }
             ggml_backend_tensor_set(vl, scratch.data(), 0, nbytes);
         }
     }
 
-    cache.pos_base_swa += (llama_pos) (live - W);
-    cache.head_swa      = cache.sink_rows + W;
+    cache.pos_base_swa += (llama_pos) drop;
+    cache.head_swa      = cache.sink_rows + n_keep;
 }
 
 // find how many cells are currently in use
@@ -9051,8 +9072,10 @@ struct llama_context * llama_init_from_model(
             }
         }
 
-        if (ctx->kv_self.any_compacted() && cparams.mtp && model->arch != LLM_ARCH_DEEPSEEK4) {
-            LLAMA_LOG_ERROR("%s: --swa-compress is not supported together with MTP speculative decoding for this model\n", __func__);
+        if (ctx->kv_self.any_compacted() && cparams.mtp &&
+                model->arch != LLM_ARCH_DEEPSEEK4 && model->arch != LLM_ARCH_STEP35) {
+            LLAMA_LOG_ERROR("%s: --swa-compress is not supported together with MTP speculative decoding for this model "
+                            "(only DeepSeek4 and Step35 have compaction-aware rewind semantics)\n", __func__);
             llama_free(ctx);
             return nullptr;
         }
