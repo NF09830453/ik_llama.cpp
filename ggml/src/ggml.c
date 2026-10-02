@@ -22514,6 +22514,12 @@ static inline float ggml_bicubic_interp(float p0, float p1, float p2, float p3, 
     return p0 * w0 + p1 * w1 + p2 * w2 + p3 * w3;
 }
 
+// triangle filter for antialias bilinear (== upstream std::max(1.0f - fabsf(x), 0.0f))
+static inline float ggml_triangle_filter(float x) {
+    float t = 1.0f - fabsf(x);
+    return t > 0.0f ? t : 0.0f;
+}
+
 static void ggml_compute_forward_upscale_f32(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst) {
@@ -22542,7 +22548,7 @@ static void ggml_compute_forward_upscale_f32(
         sf1 = ne1 > 1 && ne01 > 1 ? (float)(ne1 - 1) / (ne01 - 1) : sf1;
     }
 
-    if (mode == GGML_SCALE_MODE_NEAREST || mode == GGML_SCALE_MODE_BILINEAR) {
+    if (mode == GGML_SCALE_MODE_NEAREST) {
         for (int64_t i3 = 0; i3 < ne3; i3++) {
             const int64_t i03 = i3 / sf3;
             for (int64_t i2 = ith; i2 < ne2; i2 += nth) {
@@ -22556,6 +22562,107 @@ static void ggml_compute_forward_upscale_f32(
                               float * y = (float *)((char *)  dst->data +  i0*nb0  +  i1*nb1  +  i2*nb2  +  i3*nb3);
 
                         *y = *x;
+                    }
+                }
+            }
+        }
+    } else if (mode == GGML_SCALE_MODE_BILINEAR && (mode_flags & GGML_SCALE_FLAG_ANTIALIAS)) {
+        // upstream parity port (ggml-cpu/ops.cpp ggml_compute_forward_upscale_f32 antialias branch):
+        // Similar to F.interpolate(..., mode="bilinear", align_corners=False, antialias=True)
+        // https://github.com/pytorch/pytorch/blob/8871ff29b743948d1225389d5b7068f37b22750b/aten/src/ATen/native/cpu/UpSampleKernel.cpp
+
+        // support and invscale, minimum 1 pixel for bilinear
+        const float support1  = 1.0f / sf1 > 1.0f ? 1.0f / sf1 : 1.0f;
+        const float invscale1 = 1.0f / support1;
+        const float support0  = 1.0f / sf0 > 1.0f ? 1.0f / sf0 : 1.0f;
+        const float invscale0 = 1.0f / support0;
+
+        for (int64_t i3 = 0; i3 < ne3; i3++) {
+            const int64_t i03 = i3 / sf3;
+            for (int64_t i2 = ith; i2 < ne2; i2 += nth) {
+                const int64_t i02 = i2 / sf2;
+                for (int64_t i1 = 0; i1 < ne1; i1++) {
+                    const float y = ((float) i1 + pixel_offset) / sf1;
+                    for (int64_t i0 = 0; i0 < ne0; i0++) {
+                        const float x = ((float) i0 + pixel_offset) / sf0;
+
+                        // the range of source pixels that contribute
+                        // (upstream std::min/std::max<int64_t>: truncate float to int64_t, then clamp)
+                        int64_t x_min = (int64_t)(x - support0 + pixel_offset); if (x_min < 0) x_min = 0;
+                        int64_t x_max = (int64_t)(x + support0 + pixel_offset); if (x_max > ne00) x_max = ne00;
+                        int64_t y_min = (int64_t)(y - support1 + pixel_offset); if (y_min < 0) y_min = 0;
+                        int64_t y_max = (int64_t)(y + support1 + pixel_offset); if (y_max > ne01) y_max = ne01;
+
+                        // bilinear filter with antialiasing
+                        float val = 0.0f;
+                        float total_weight = 0.0f;
+
+                        for (int64_t sy = y_min; sy < y_max; sy++) {
+                            const float weight_y = ggml_triangle_filter((sy - y + pixel_offset) * invscale1);
+
+                            for (int64_t sx = x_min; sx < x_max; sx++) {
+                                const float weight_x = ggml_triangle_filter((sx - x + pixel_offset) * invscale0);
+                                const float weight = weight_x * weight_y;
+
+                                if (weight <= 0.0f) {
+                                    continue;
+                                }
+
+                                const float pixel = *(const float *)((const char *)src0->data + sx*nb00 + sy*nb01 + i02*nb02 + i03*nb03);
+                                val += pixel * weight;
+                                total_weight += weight;
+                            }
+                        }
+
+                        if (total_weight > 0.0f) {
+                            val /= total_weight;
+                        }
+
+                        float * dst_ptr = (float *)((char *)dst->data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3);
+                        *dst_ptr = val;
+                    }
+                }
+            }
+        }
+    } else if (mode == GGML_SCALE_MODE_BILINEAR) {
+        // upstream parity port (ggml-cpu/ops.cpp plain bilinear branch; fork used to
+        // sample NEAREST for bilinear -- nearest-copy is upstream's NEAREST branch only)
+        for (int64_t i3 = 0; i3 < ne3; i3++) {
+            const int64_t i03 = i3 / sf3;
+            for (int64_t i2 = ith; i2 < ne2; i2 += nth) {
+                const int64_t i02 = i2 / sf2;
+                for (int64_t i1 = 0; i1 < ne1; i1++) {
+                    const float y = ((float)i1 + pixel_offset) / sf1 - pixel_offset;
+                    int64_t y0 = (int64_t)floorf(y);
+                    int64_t y1 = y0 + 1;
+
+                    y0 = GGML_CLAMP(y0, 0, ne01 - 1);
+                    y1 = GGML_CLAMP(y1, 0, ne01 - 1);
+
+                    float dy = y - (float)y0;
+                    dy = GGML_CLAMP(dy, 0.0f, 1.0f);
+
+                    for (int64_t i0 = 0; i0 < ne0; i0++) {
+                        const float x = ((float)i0 + pixel_offset) / sf0 - pixel_offset;
+                        int64_t x0 = (int64_t)floorf(x);
+                        int64_t x1 = x0 + 1;
+
+                        x0 = GGML_CLAMP(x0, 0, ne00 - 1);
+                        x1 = GGML_CLAMP(x1, 0, ne00 - 1);
+
+                        float dx = x - (float)x0;
+                        dx = GGML_CLAMP(dx, 0.0f, 1.0f);
+
+                        // fetch the four surrounding pixel values and interpolate
+                        const float a = *(const float *)((const char *)src0->data + x0*nb00 + y0*nb01 + i02*nb02 + i03*nb03);
+                        const float b = *(const float *)((const char *)src0->data + x1*nb00 + y0*nb01 + i02*nb02 + i03*nb03);
+                        const float c = *(const float *)((const char *)src0->data + x0*nb00 + y1*nb01 + i02*nb02 + i03*nb03);
+                        const float d = *(const float *)((const char *)src0->data + x1*nb00 + y1*nb01 + i02*nb02 + i03*nb03);
+
+                        const float val = a*(1 - dx)*(1 - dy) + b*dx*(1 - dy) + c*(1 - dx)*dy + d*dx*dy;
+
+                        float * y_dst = (float *)((char *)dst->data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3);
+                        *y_dst = val;
                     }
                 }
             }
