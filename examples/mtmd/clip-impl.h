@@ -168,6 +168,7 @@ enum projector_type {
     PROJECTOR_TYPE_COGVLM,
     PROJECTOR_TYPE_JANUS_PRO,
     PROJECTOR_TYPE_MINIMAX_M3_VL,
+    PROJECTOR_TYPE_STEP3VL,
     PROJECTOR_TYPE_UNKNOWN,
 
 };
@@ -199,6 +200,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_COGVLM,    "cogvlm"},
     { PROJECTOR_TYPE_JANUS_PRO, "janus_pro"},
     { PROJECTOR_TYPE_MINIMAX_M3_VL, "minimax_m3_vl"},
+    { PROJECTOR_TYPE_STEP3VL,       "step3vl"},
 };
 
 static projector_type clip_projector_type_from_string(const std::string & str) {
