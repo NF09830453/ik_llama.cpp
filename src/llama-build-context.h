@@ -394,7 +394,10 @@ struct llm_build_context {
             ggml_tensor * sorted,   // [n_kv, n_tokens] (I32) full descending argsort of scores
             ggml_tensor * KQ_mask,  // F32 causal mask [n_kv, n_tokens_pad]
             // kept-slot-count override; -1 = hparams.indexer_top_k / cparams.dsa_top_k as before
-            int64_t n_top_k_override = -1);
+            int64_t n_top_k_override = -1,
+            // optional caller-owned {1, n_kv, n_tokens} F32 leaf reused across per-layer calls
+            // (see the base_leaf note in the impl — compute-buffer leaf-pinning workaround)
+            ggml_tensor * base_leaf = nullptr);
 
     // Adapt the (F32, unpadded) sparse mask to the shape/dtype ggml_flash_attn_ext requires on this
     // fork: F16, contiguous, ne[1] padded to GGML_KQ_MASK_PAD (== the dense KQ_mask's padded shape).

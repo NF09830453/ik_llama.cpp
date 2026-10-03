@@ -503,6 +503,15 @@ ggml_cgraph * llm_build_context::build_step35() {
     const int n_layer_base = hparams.n_layer > hparams.nextn_predict_layers
         ? hparams.n_layer - hparams.nextn_predict_layers : hparams.n_layer;
 
+    // Shared destination leaf for the per-layer sparse-mask scatter (build_deepseek2_dsa_sparse_mask
+    // base_leaf param). A fresh leaf per layer is pinned by gallocr from graph start (leaves are
+    // allocated up-front there), costing n_full_layers x {n_kv, n_tokens} F32 ~= 6 GiB at prod
+    // kv 16128 / ub 4096 even though each layer's consumer runs in the same layer — measured
+    // linear growth in _leaf_liveness_test + the persistent 7328 MiB sparse-mode compute buffer.
+    // One shared leaf = 1 equiv persistent; graph order serializes the fills (fill fully
+    // overwrites before set_rows reads). Created lazily: only the sparse path consumes it.
+    ggml_tensor * sparse_base_leaf = nullptr;
+
     for (int il = 0; il < n_layer_base; ++il) {
         bool is_swa = hparams.swa_layers[il];
         auto & layer = const_cast<llama_layer&>(model.layers[il]);
@@ -540,7 +549,10 @@ ggml_cgraph * llm_build_context::build_step35() {
             const int64_t kept_slots = ik_sel_block_grain()
                 ? (int64_t) hparams.indexer_top_k * Bsel
                 : (int64_t) hparams.indexer_top_k;
-            ggml_tensor * sparse = build_deepseek2_dsa_sparse_mask(sorted, KQ_mask, kept_slots);
+            if (!sparse_base_leaf) {
+                sparse_base_leaf = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, KQ_mask->ne[0], idx_score->ne[1]);
+            }
+            ggml_tensor * sparse = build_deepseek2_dsa_sparse_mask(sorted, KQ_mask, kept_slots, sparse_base_leaf);
             cb(sparse, "step35_sparse_mask", il); // rename tap for step35 G4 telemetry
             if (flash_attn) {
                 sparse = build_deepseek2_dsa_fa_mask(sparse, KQ_mask);

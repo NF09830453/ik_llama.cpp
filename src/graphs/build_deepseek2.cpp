@@ -628,7 +628,8 @@ ggml_tensor * llm_build_context::build_deepseek2_dsa_indexer(
 ggml_tensor * llm_build_context::build_deepseek2_dsa_sparse_mask(
         ggml_tensor * sorted,
         ggml_tensor * KQ_mask,
-        int64_t n_top_k_override) {
+        int64_t n_top_k_override,
+        ggml_tensor * base_leaf) {
     const int64_t n_kv_local = KQ_mask->ne[0];
     const int64_t n_tok      = sorted->ne[1];
 
@@ -659,8 +660,21 @@ ggml_tensor * llm_build_context::build_deepseek2_dsa_sparse_mask(
     ggml_tensor * pen_b = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_kv_local, n_tok);
     pen_b = ggml_repeat(ctx0, pen, pen_b);                                            // {1, n_kv, n_tok}
 
-    // destination base {1, n_kv, n_tok} (contents irrelevant — fully overwritten by set_rows)
-    ggml_tensor * base = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_kv_local, n_tok);
+    // destination base {1, n_kv, n_tok} (contents irrelevant — fully overwritten by set_rows).
+    // CALLER-PROVIDED base_leaf (optional): a fresh leaf here is a graph LEAF (op NONE, no src),
+    // and ggml_gallocr allocates every leaf up-front (ggml-alloc.c "allocate leafs" loop) — a
+    // per-layer leaf pins {n_kv, n_tok} F32 for the WHOLE graph even though its consumer runs
+    // in the same layer (measured: linear n_layer x {kv,ub} growth, _leaf_liveness_test).
+    // Callers building this mask per layer pass one shared leaf; graph order serializes the
+    // fills, so a single {1, n_kv, n_tok} buffer serves all layers (1 equiv persistent instead
+    // of n_layer equiv pinned at t=0).
+    ggml_tensor * base = base_leaf;
+    if (base) {
+        GGML_ASSERT(base->type == GGML_TYPE_F32 && base->ne[0] == 1 &&
+                base->ne[1] == n_kv_local && base->ne[2] == n_tok);
+    } else {
+        base = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_kv_local, n_tok);
+    }
     base = ggml_fill(ctx0, base, -BIG);
 
     // indices: {n_kv, n_tok, 1}. scatter pen_b[:, rank, j] into base[:, sorted[rank,j], j].
