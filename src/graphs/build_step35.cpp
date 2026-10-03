@@ -206,7 +206,13 @@ ggml_tensor * llm_build_context::build_step35_indexer_score(ggml_cgraph * gf, in
     GGML_ASSERT(inpL->ne[2] == 1);
     ggml_tensor * inpL_view = ggml_view_2d(ctx0, inpL, inpL->ne[0], inpL->ne[1], inpL->nb[1], 0);
     cb(inpL_view, "step35_indexer_inpL", il);
-    ggml_build_forward_expand(gf, inpL_view); // dangling telemetry must ROOT in the graph
+    // ROOT only under tap capture (cb_eval): a rooted tensor is never consumed, so gallocr pins
+    // it to graph end -- unrooted, this alias costs ZERO (nothing reads it). Unconditional rooting
+    // pinned {n_embd, n_tokens} F32 x n_layer (measured: the dominant share of the 7382 MiB
+    // reserve at kv 16128 / ub 4096 -- see _compute_buf_microbench attribution).
+    if (lctx.cparams.cb_eval) {
+        ggml_build_forward_expand(gf, inpL_view);
+    }
 
     // pe/nope split over indexer_rope_dim (HF sparse_indexer_rope_dim: 32); clamped so toy
     // harness dims (proxy_dim <= rope_dim) rope the whole proxy instead of building empty views.
@@ -256,9 +262,12 @@ ggml_tensor * llm_build_context::build_step35_indexer_score(ggml_cgraph * gf, in
     // w ≡ fork DSA per-head indexer weights) ----
     ggml_tensor * z_cur = ggml_mul_mat(ctx0, layer.indexer_z, inpL); // {head_size, n_tokens}
     cb(z_cur, "step35_indexer_z_raw", il);
-    ggml_build_forward_expand(gf, z_cur); // z is telemetry-only: unconsumed cb() tensors never
-                                          // enter the graph and cb_eval never fires (inp_dsa_sink
-                                          // precedent) -- root it explicitly
+    // z is telemetry-only: unconsumed cb() tensors never enter the graph and cb_eval never
+    // fires (inp_dsa_sink precedent) -- root it explicitly, but ONLY under tap capture
+    // (unrooted z_cur would otherwise be pruned, which is exactly what prod wants).
+    if (lctx.cparams.cb_eval) {
+        ggml_build_forward_expand(gf, z_cur);
+    }
 
     ggml_tensor * w_cur = ggml_mul_mat(ctx0, layer.indexer_w, inpL); // {n_ihead, n_tokens}
     w_cur = ggml_scale(ctx0, w_cur, 1.0f / sqrtf(float(head_size * n_ihead))); // DSA :488 port
@@ -310,19 +319,58 @@ ggml_tensor * llm_build_context::build_step35_indexer_score(ggml_cgraph * gf, in
     }
 
     // scoring chain reused VERBATIM for token keys or pooled block keys (n_key = n_kv / n_blocks)
+    //
+    // Compute-buffer shape discipline (build_deepseek2.cpp:513 two-branch precedent): the fused
+    // {n_key, n_ihead*n_tokens} shape is deliberately capped at 8 tokens -- at llama-server
+    // ubatches its kq/relu/cont/mul temporaries are EACH ~{n_key, 16*n_tokens} F32
+    // (== 2 x kv_size*n_ubatch*4 B at CSA block grain) and dominate the CUDA compute buffer
+    // (measured reserve law: ~29 x {kv,ub} F32 equivalents, kv_size*n_ubatch*117 B total).
+    // Real ubatches run the math PER INDEXER HEAD instead (build_deepseek2.cpp:552 branch):
+    // {n_key, n_tokens} F32 temporaries (~kv*n_ubatch/8 B), no transpose/cont anywhere
+    // (broadcast mul keeps both operands contiguous), heads accumulated ascending.
+    // NUMERIC NOTE: sequential add-accumulate over heads is NOT bitwise == the fused chain's
+    // ggml_sum_rows reduction -- accepted drift on n_tokens>8 graphs only (ingest/reserve);
+    // decode/MTP graphs (<=8 tokens) keep the fused path byte-identical. Gates: harness tap
+    // tapes regenerate + _oracle_step35.py compare; G1 dense-equivalence unaffected
+    // (IK_SPARSE=0 masks selection regardless of idx_score). Per-head taps key on
+    // il_cb = 1000*(il+1)+head (deepseek2 head-loop naming precedent).
     auto score_chain = [&](ggml_tensor * keys, int64_t n_key) {
-        ggml_tensor * q2d = ggml_reshape_2d(ctx0, q_cur, head_size, n_ihead * n_tokens);
-        ggml_tensor * kq = ggml_mul_mat(ctx0, keys, q2d); // {n_key, n_ihead*n_tokens}
-        cb(kq, "step35_indexer_kq", il);
-        kq = ggml_relu(ctx0, kq);
-        cb(kq, "step35_indexer_kq_relu", il);
-        kq = ggml_reshape_3d(ctx0, kq, n_key, n_ihead, n_tokens);
-        kq = ggml_cont(ctx0, ggml_transpose(ctx0, kq)); // {n_ihead, n_key, n_tokens}
-        ggml_tensor * w3 = ggml_reshape_3d(ctx0, w_cur, n_ihead, 1, n_tokens);
-        kq = ggml_mul(ctx0, kq, w3);
-        cb(kq, "step35_indexer_kq_w", il);
-        ggml_tensor * s = ggml_sum_rows(ctx0, kq); // {1, n_key, n_tokens}
-        return ggml_reshape_2d(ctx0, s, n_key, n_tokens);
+        if (n_tokens <= 8) {
+            ggml_tensor * q2d = ggml_reshape_2d(ctx0, q_cur, head_size, n_ihead * n_tokens);
+            ggml_tensor * kq = ggml_mul_mat(ctx0, keys, q2d); // {n_key, n_ihead*n_tokens}
+            cb(kq, "step35_indexer_kq", il);
+            kq = ggml_relu(ctx0, kq);
+            cb(kq, "step35_indexer_kq_relu", il);
+            kq = ggml_reshape_3d(ctx0, kq, n_key, n_ihead, n_tokens);
+            kq = ggml_cont(ctx0, ggml_transpose(ctx0, kq)); // {n_ihead, n_key, n_tokens}
+            ggml_tensor * w3 = ggml_reshape_3d(ctx0, w_cur, n_ihead, 1, n_tokens);
+            kq = ggml_mul(ctx0, kq, w3);
+            cb(kq, "step35_indexer_kq_w", il);
+            ggml_tensor * s = ggml_sum_rows(ctx0, kq); // {1, n_key, n_tokens}
+            return ggml_reshape_2d(ctx0, s, n_key, n_tokens);
+        }
+        ggml_tensor * acc = nullptr;
+        for (int64_t head = 0; head < n_ihead; ++head) {
+            const int il_cb = 1000 * (il + 1) + (int) head;
+            // [head_size, n_tokens]: per-head slice of contiguous q_cur {head_size, n_ihead,
+            // n_tokens} -- nb1 stride between heads, nb2 stride between tokens (deepseek2 :555)
+            ggml_tensor * q_h = ggml_view_2d(ctx0, q_cur, head_size, n_tokens,
+                    ggml_row_size(q_cur->type, head_size) * n_ihead,
+                    ggml_row_size(q_cur->type, head_size) * head);
+            // [n_key, n_tokens]
+            ggml_tensor * kq = ggml_mul_mat(ctx0, keys, q_h);
+            cb(kq, "step35_indexer_kq", il_cb);
+            kq = ggml_relu(ctx0, kq);
+            cb(kq, "step35_indexer_kq_relu", il_cb);
+            // [1, n_tokens] contiguous slice of w_cur {n_ihead, n_tokens}; cont because the CUDA
+            // ggml_mul path wants contiguous tensors (build_deepseek2.cpp:520 caveat)
+            ggml_tensor * w_h = ggml_cont(ctx0, ggml_view_2d(ctx0, w_cur, 1, n_tokens,
+                    w_cur->nb[1], w_cur->nb[0] * head));
+            kq = ggml_mul(ctx0, kq, w_h); // broadcast {n_key, n_tokens} x {1, n_tokens}
+            cb(kq, "step35_indexer_kq_w", il_cb);
+            acc = acc ? ggml_add_inplace(ctx0, acc, kq) : kq;
+        }
+        return acc; // {n_key, n_tokens}
     };
 
     ggml_tensor * slot_score;
@@ -378,7 +426,13 @@ ggml_tensor * llm_build_context::build_step35_indexer_score(ggml_cgraph * gf, in
 
     ggml_tensor * indexer_score = ggml_add(ctx0, mask_f32, slot_score);
     cb(indexer_score, "step35_indexer_score", il);
-    ggml_build_forward_expand(gf, indexer_score);
+    // ROOT only under tap capture: with IK_SPARSE=1 the argsort consumes indexer_score (expand
+    // redundant), with IK_SPARSE=0 it is telemetry-only -- unconditional rooting pinned one
+    // {n_kv, n_tokens} F32 PER LAYER to graph end (23 layers x 1 equiv ~= 6 GiB at prod config;
+    // _compute_buf_microbench --layers 23 attribution).
+    if (lctx.cparams.cb_eval) {
+        ggml_build_forward_expand(gf, indexer_score);
+    }
     return indexer_score;
 }
 
