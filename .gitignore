@@ -176,3 +176,23 @@ _attic/
 
 # local quant recipes
 /quantscripts/
+
+# loose root artifacts NOT underscore-prefixed (Oct hygiene sweep — private logs,
+# research notes, patches, imatrix binaries). Move-to-_attic candidates until then.
+/prod-logs/
+/conjecture-*.txt
+/csa_ssmax.md
+/dsv3_tok.json
+/gguf-py/scripts/step5meta.txt
+/imatrix-512ex*.txt
+/mainline-step35.cpp
+/mmproj-quant-ladder.md
+/needle1.txt
+/post_fix_launch_log.txt
+/root-remove-launch.txt
+/step5-llamacpp.patch
+/step5-log.txt
+/step-preview-A.imatrix*
+/ubergarm-imatrix-calibration-corpus-v02.txt
+*.imatrix
+*.imatrix.at_*
