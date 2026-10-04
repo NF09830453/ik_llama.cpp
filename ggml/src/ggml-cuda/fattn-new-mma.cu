@@ -1990,7 +1990,7 @@ static void launch_fattn_new_mma(
         blocks_num.y = 1;
         blocks_num.z = 1;
 
-        dst_tmp_meta.alloc(blocks_num.x*ncols * (2*2 + DV) * sizeof(float));
+        dst_tmp_meta.alloc(((size_t) blocks_num.x) * ncols * (2 + DV/2));
     } else {
         GGML_ASSERT(K->ne[1] % KQ_row_granularity == 0);
         const int ntiles_KQ = K->ne[1] / KQ_row_granularity; // Max. number of parallel blocks limited by tensor size.
@@ -2279,6 +2279,10 @@ void ggml_cuda_flash_attn_ext_mma_new(ggml_backend_cuda_context & ctx, ggml_tens
         GGML_ASSERT(Q->ne[0] == 256 && V->ne[0] == 256);
         if (gqa_ratio % 6 == 0) {
             ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 1, 8>(ctx, dst);
+        //if (gqa_ratio == 12) {
+        //    ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 1, 16>(ctx, dst);
+        //} else if (gqa_ratio == 6) {
+        //    ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 1, 8>(ctx, dst);
         } else {
             GGML_ABORT("Not implemented");
         }

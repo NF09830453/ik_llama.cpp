@@ -25,7 +25,9 @@ ggml_cgraph * llm_build_context::build_mimo2() {
         ? build_swa_mask_for_graph(hparams.n_swa, true)
         : build_inp_KQ_mask_swa();
 
-    for (int il = 0; il < n_layer; ++il) {
+    const int n_transformer_layers = n_layer - hparams.nextn_predict_layers;
+
+    for (int il = 0; il < n_transformer_layers; ++il) {
         const bool is_sliding = model.hparams.swa_layers[il];
         auto KQ_mask_l = is_sliding ? KQ_mask_swa : KQ_mask;
 

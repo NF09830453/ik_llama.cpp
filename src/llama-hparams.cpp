@@ -4,6 +4,7 @@
 #include "llama-model.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <map>
 
@@ -260,6 +261,46 @@ void llm_load_hparams(
 
     // arch-specific KVs
     switch (model.arch) {
+        case LLM_ARCH_K2_HORIZON:
+            {
+                // Common attention
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+
+                // MoVA (Mixture-of-Values Attention) — optional for dense models
+                ml.get_key(LLM_KV_ATTENTION_GROUPNORM_GROUPS,   hparams.n_norm_groups);
+                ml.get_key(LLM_KV_ATTENTION_VALUE_EXPERT_COUNT,      hparams.n_value_expert, false);
+                ml.get_key(LLM_KV_ATTENTION_VALUE_EXPERT_USED_COUNT, hparams.n_value_expert_used, false);
+                if (hparams.n_value_expert > 0) {
+                    hparams.f_norm_group_eps = hparams.f_norm_rms_eps;
+                }
+
+                // MoE expert FFN params
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
+                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,               hparams.n_expert_shared, false);
+                ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
+                ml.get_key(LLM_KV_EXPERT_GATING_FUNC,                hparams.expert_gating_func, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,               hparams.expert_weights_norm, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,              hparams.expert_weights_scale, false);
+
+                // Dense/MoE layer split
+                ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT, hparams.n_layer_dense_lead, false);
+
+                // Model type detection
+                if (hparams.n_expert > 0) {
+                    // MoE variant
+                    switch (hparams.n_layer) {
+                        case 48: model.type = e_model::MODEL_36B_A4B; break;
+                        default: model.type = e_model::MODEL_UNKNOWN;
+                    }
+                } else {
+                    // Dense variant
+                    switch (hparams.n_layer) {
+                        case 28: model.type = e_model::MODEL_1B; break;
+                        case 36: model.type = hparams.n_embd == 2560 ? e_model::MODEL_4B : e_model::MODEL_7B; break;
+                        default: model.type = e_model::MODEL_UNKNOWN;
+                    }
+                }
+            } break;
         case LLM_ARCH_LLAMA:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -586,6 +627,80 @@ void llm_load_hparams(
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_LFM2:
+        case LLM_ARCH_LFM2MOE:
+            {
+                const bool is_moe = model.arch == LLM_ARCH_LFM2MOE;
+
+                ml.get_key(LLM_KV_SHORTCONV_L_CACHE,           hparams.n_shortconv_l_cache);
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_ATTENTION_CAUSAL,            hparams.causal_attn, false);
+                ml.get_key(LLM_KV_POOLING_TYPE,                hparams.pooling_type, false);
+
+                // a missing pooling key (reported as UNSPECIFIED) means a plain causal LLM
+                if (hparams.pooling_type == LLAMA_POOLING_TYPE_UNSPECIFIED) {
+                    hparams.pooling_type = LLAMA_POOLING_TYPE_NONE;
+                }
+
+                if (!hparams.causal_attn || hparams.pooling_type != LLAMA_POOLING_TYPE_NONE) {
+                    throw std::runtime_error(is_moe
+                            ? "LFM2-MoE: only causal LLM models are supported (VL, ColBERT, embedding and audio variants are not supported)"
+                            : "LFM2: only dense causal LLM models are supported (MoE, VL, ColBERT, embedding and audio variants are not supported)");
+                }
+
+                if (hparams.n_shortconv_l_cache <= 1) {
+                    throw std::runtime_error("LFM2 shortconv.l_cache must be greater than 1");
+                }
+
+                // short-conv layers have n_head_kv == 0, GQA layers have n_head_kv > 0
+                for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                    hparams.recurrent_layer_arr[i] = hparams.n_head_kv(i) == 0;
+                }
+
+                if (is_moe) {
+                    hparams.n_layer_dense_lead = 0;
+                    ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,  hparams.n_layer_dense_lead, false);
+                    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp);
+                    hparams.expert_gating_func = LLM_EXPERT_GATING_FUNC_SIGMOID;
+                    ml.get_key(LLM_KV_EXPERT_GATING_FUNC,         hparams.expert_gating_func, false);
+                    hparams.expert_weights_norm = true;
+                    ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,  hparams.expert_weights_norm,  false);
+                    ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE, hparams.expert_weights_scale, false);
+
+                    if (hparams.n_expert == 0 || hparams.n_expert_used == 0) {
+                        throw std::runtime_error("LFM2-MoE requires a non-zero expert count");
+                    }
+                    if (hparams.n_layer_dense_lead > hparams.n_layer) {
+                        throw std::runtime_error("LFM2-MoE leading_dense_block_count exceeds the block count");
+                    }
+
+                    switch (hparams.n_layer) {
+                        case 24: model.type = e_model::MODEL_8B_A1B;  break;
+                        case 40: model.type = e_model::MODEL_24B_A2B; break;
+                        default: model.type = e_model::MODEL_UNKNOWN;
+                    }
+                } else {
+                    hparams.n_layer_dense_lead = hparams.n_layer;
+
+                    switch (hparams.n_ff()) {
+                        case 2560: model.type = e_model::MODEL_220M; break;
+                        case 4608: model.type = e_model::MODEL_350M; break;
+                        case 6912: model.type = e_model::MODEL_700M; break;
+                        case 8192: model.type = e_model::MODEL_1_2B; break;
+                        case 10752: model.type = e_model::MODEL_2_6B; break;
+                        default: model.type = e_model::MODEL_UNKNOWN;
+                    }
+                }
+
+                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
+                if (hparams.n_swa > 0) {
+                    hparams.rope_freq_base_train_swa = hparams.rope_freq_base_train;
+                    hparams.rope_freq_scale_train_swa = 1.0f;
+                    for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                        hparams.swa_layers[i] = hparams.recurrent_layer_arr[i] ? 0 : 1;
+                    }
+                }
+            } break;
         case LLM_ARCH_QWEN3NEXT:
             {
                 ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
@@ -679,9 +794,10 @@ void llm_load_hparams(
                         std::vector<uint32_t> ple_layers;
                         ml.get_arr(ml.llm_kv(LLM_KV_PLE_LAYERS), ple_layers);
                         for (uint32_t il : ple_layers) {
-                            if (il < hparams.n_layer) {
-                                hparams.ple_layer_arr[il] = true;
+                            if (il >= hparams.n_layer) {
+                                throw std::runtime_error(format("qwen4exp: PLE layer index %u is outside block count %u", il, hparams.n_layer));
                             }
+                            hparams.ple_layer_arr[il] = true;
                         }
                         ml.get_key(LLM_KV_PLE_NGRAM_SIZE,      hparams.ple_ngram_size);
                         ml.get_key(LLM_KV_PLE_HEADS_PER_NGRAM, hparams.ple_heads_per_ngram);
@@ -1724,6 +1840,9 @@ void llm_load_hparams(
                 //TODO
                 //hparams.swa_type = LLAMA_SWA_TYPE_STANDARD; // which is the same as OpenAI
                 ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer);
+                ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,              hparams.nextn_predict_layers, false);
+                // TODO: when MTP is implemented, this should probably be updated if needed
+                hparams.n_layer_kv_from_start = hparams.n_layer - hparams.nextn_predict_layers;
 
                 switch (hparams.n_layer) {
                     case 48: model.type = e_model::MODEL_310B_A15B; break;
@@ -1930,6 +2049,7 @@ void llm_load_hparams(
             } break;
         case LLM_ARCH_DFLASH:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_GLM_DSA:
             {
                 if (model.arch == LLM_ARCH_DFLASH) {
@@ -1975,9 +2095,9 @@ void llm_load_hparams(
                     model.type = e_model::MODEL_UNKNOWN;
                     break;
                 }
-                const bool is_dsv4 = model.arch == LLM_ARCH_DEEPSEEK4 || hparams.dflash_dsv4;
+                const bool is_dsv4 = llm_arch_is_dsv4(model.arch) || hparams.dflash_dsv4;
                 ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
-                if (model.arch == LLM_ARCH_DEEPSEEK4 && hparams.n_layer == 43 && hparams.nextn_predict_layers > 0) {
+                if (llm_arch_is_dsv4(model.arch) && hparams.n_layer == 43 && hparams.nextn_predict_layers > 0) {
                     LLAMA_LOG_WARN("===============================================================================================\n");
                     LLAMA_LOG_WARN("Unexpected number of layers (%d) and nextn_predict_layers (%d) for DeepSeek4-Flash\n",
                             hparams.n_layer, hparams.nextn_predict_layers);
@@ -2070,6 +2190,8 @@ void llm_load_hparams(
                     if (!ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer, false) && hparams.n_swa > 0) {
                         std::fill(hparams.swa_layers.begin(), hparams.swa_layers.end(), true);
                     }
+                    // DSV4 vision: in a non-causal (image) span the window only clips older tokens
+                    hparams.swa_full_non_causal = true;
 
                     const auto * hc_head_base = ml.get_tensor_meta("hc_head_base");
                     const uint32_t probe_layer = dsv4_probe_layer;
@@ -2108,6 +2230,45 @@ void llm_load_hparams(
                     }
                     ml.get_key(LLM_KV_HASH_LAYER_COUNT, hparams.dsv4_hash_layer_count, false);
 
+                    if (model.arch == LLM_ARCH_DEEPSEEK41) {
+                        ml.get_arr_n(LLM_KV_ENGRAM_LAYER_IDS, hparams.engram_n_layer);
+                        if (hparams.engram_n_layer == 0 || hparams.engram_n_layer > LLAMA_MAX_LAYERS) {
+                            throw std::runtime_error(format("DeepSeek-V4.1 engram layer count %u is out of range", hparams.engram_n_layer));
+                        }
+                        {
+                            std::vector<uint32_t> ids;
+                            ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_LAYER_IDS), ids);
+                            std::copy_n(ids.begin(), std::min<size_t>(ids.size(), LLAMA_MAX_LAYERS), hparams.engram_layer_ids.begin());
+                        }
+                        ml.get_key(LLM_KV_ENGRAM_HEAD_COUNT,     hparams.engram_n_head);
+                        ml.get_key(LLM_KV_ENGRAM_KEY_LENGTH,     hparams.engram_key_length);
+                        ml.get_key(LLM_KV_ENGRAM_MAX_NGRAM_SIZE, hparams.engram_max_ngram_size);
+                        ml.get_key(LLM_KV_ENGRAM_PAD_ID,         model.engram_pad_id);
+                        if (hparams.engram_n_head == 0 || hparams.engram_max_ngram_size < 2) {
+                            throw std::runtime_error("DeepSeek-V4.1 engram needs at least one head and a 2-gram");
+                        }
+                        for (uint32_t e = 0; e < hparams.engram_n_layer; ++e) {
+                            if (hparams.engram_layer_ids[e] >= hparams.n_layer) {
+                                throw std::runtime_error(format("engram layer %u is out of range", hparams.engram_layer_ids[e]));
+                            }
+                        }
+                        ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_MULTIPLIERS), model.engram_multipliers);
+                        ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_PRIMES),      model.engram_primes);
+                        ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_OFFSETS),     model.engram_offsets);
+                        ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_TOKEN_MAP),   model.engram_token_map);
+                        const size_t n_bucket = (size_t) (hparams.engram_max_ngram_size - 1) * hparams.engram_n_head;
+                        if (model.engram_multipliers.size() != (size_t) hparams.engram_n_layer * hparams.engram_max_ngram_size) {
+                            throw std::runtime_error("engram multiplier count does not match layers * ngram size");
+                        }
+                        if (model.engram_primes.size() != (size_t) hparams.engram_n_layer * n_bucket ||
+                            model.engram_offsets.size() != model.engram_primes.size()) {
+                            throw std::runtime_error("engram prime or offset count does not match layers * buckets");
+                        }
+                        for (uint64_t p : model.engram_primes) {
+                            if (p == 0) throw std::runtime_error("engram prime of zero would divide by zero in the hash");
+                        }
+                    }
+
                     uint32_t n_compress_ratios = 0;
                     if (ml.get_arr_n(LLM_KV_ATTENTION_COMPRESS_RATIOS, n_compress_ratios, false)) {
                         if (n_compress_ratios < hparams.n_layer) {
@@ -2134,6 +2295,77 @@ void llm_load_hparams(
                         }
                     }
 
+                    if (model.arch == LLM_ARCH_DEEPSEEK41) {
+                        // a source carries a compressor, a key owner indexer.attn_k, an index source
+                        // indexer.attn_q_b: walk the layers once and record who reads from whom
+                        hparams.dsv4_shared_streams = true;
+                        hparams.dsv41_kv_source.fill(-1);
+                        hparams.dsv41_index_key_source.fill(-1);
+                        hparams.dsv41_topk_source.fill(-1);
+                        int32_t last_kv = -1, last_key = -1, last_idx = -1;
+                        uint32_t csa_ratio = 0, hca_ratio = 0;
+                        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                            const bool has_comp  = ml.get_tensor_meta(format("blk.%u.attn_compressor_kv.weight", il).c_str()) != nullptr;
+                            const bool has_gate  = ml.get_tensor_meta(format("blk.%u.attn_compressor_gate.weight", il).c_str()) != nullptr;
+                            const bool has_idx_k = ml.get_tensor_meta(format("blk.%u.indexer.attn_k.weight", il).c_str()) != nullptr;
+                            const bool has_idx_q = ml.get_tensor_meta(format("blk.%u.indexer.attn_q_b.weight", il).c_str()) != nullptr;
+                            if (has_comp)  last_kv  = (int32_t) il;
+                            if (has_idx_k) last_key = (int32_t) il;
+                            if (has_idx_q) last_idx = (int32_t) il;
+                            const uint32_t r = hparams.dsv4_compress_ratios[il];
+                            if (r == 0) continue;
+                            if (last_kv < 0 || last_key < 0 || last_idx < 0) {
+                                throw std::runtime_error(format("DeepSeek-V4.1 layer %u reads a compressed stream before any layer publishes one", il));
+                            }
+                            if (r != hparams.dsv4_compress_ratios[last_kv]) {
+                                throw std::runtime_error(format("DeepSeek-V4.1 layer %u compresses at ratio %u but reads layer %d, compressed at %u",
+                                            il, r, last_kv, hparams.dsv4_compress_ratios[last_kv]));
+                            }
+                            if (has_comp && !has_gate && r != 1) {
+                                throw std::runtime_error(format("DeepSeek-V4.1 layer %u pools %u tokens per row but has no pooling gate", il, r));
+                            }
+                            hparams.dsv41_kv_source[il]        = last_kv;
+                            hparams.dsv41_index_key_source[il] = last_key;
+                            hparams.dsv41_topk_source[il]      = last_idx;
+                            if (r == csa_ratio || r == hca_ratio) continue;
+                            if      (csa_ratio == 0) csa_ratio = r;
+                            else if (hca_ratio == 0) hca_ratio = r;
+                            else throw std::runtime_error("DeepSeek-V4.1 supports at most two compression ratios");
+                        }
+                        // a file with no compressed layers is pure sliding window attention; the
+                        // ratios only have to stay non-zero for the size arithmetic
+                        if (csa_ratio == 0) csa_ratio = 1;
+                        if (hca_ratio == 0) hca_ratio = csa_ratio;
+                        // V4 splits the two streams by role -- the indexed one at CSA_RATIO, the
+                        // other at HCA_RATIO. V4.1 does not: both of its streams carry index
+                        // sources (indexer.attn_q_b on layers 2, 8, 14 at ratio 2 and on 20, 24,
+                        // 28, 32, 36 at ratio 1 in the released Flash file), so these two hold the
+                        // file's compression segments in layer order and nothing reads them as
+                        // roles -- the cache arithmetic and the graph both go through the ratio.
+                        hparams.dsv4_csa_ratio = csa_ratio;
+                        hparams.dsv4_hca_ratio = hca_ratio;
+                        hparams.dsv4_csa_overlap = false;
+                        hparams.dsv4_hca_overlap = false;
+                        hparams.dsv4_hc_lag = true;
+                        hparams.dsv4_q_head_norm = false;
+                        LLAMA_LOG_INFO("%s: DeepSeek-V4.1 compressed streams: csa ratio %u, hca ratio %u, shared from source layers\n", __func__, csa_ratio, hca_ratio);
+                    }
+                    if (std::getenv("V41_SEPARATE") != nullptr) {
+                        {
+                            uint32_t src = 0;
+                            if (ml.get_key(LLM_KV_CANDIDATE_SOURCE_LAYER, src, false)) {
+                                hparams.dsv4_candidate_source_layer = (int32_t) src;
+                            }
+                        }
+                        ml.get_key(LLM_KV_CANDIDATE_BLOCK_SIZE,  hparams.dsv4_candidate_block_size,  false);
+                        ml.get_key(LLM_KV_CANDIDATE_TOPK_BLOCKS, hparams.dsv4_candidate_topk_blocks, false);
+                        if (hparams.dsv4_candidate_source_layer < 0) { hparams.dsv4_candidate_source_layer = 20; }
+                        if (hparams.dsv4_candidate_block_size == 0)  { hparams.dsv4_candidate_block_size  = 8; }
+                        if (hparams.dsv4_candidate_topk_blocks == 0) { hparams.dsv4_candidate_topk_blocks = 2048; }
+                        LLAMA_LOG_INFO("%s: DSV4.1 hierarchical indexer: candidate source layer = %d, block size = %u, top-k blocks = %u\n",
+                                __func__, hparams.dsv4_candidate_source_layer,
+                                hparams.dsv4_candidate_block_size, hparams.dsv4_candidate_topk_blocks);
+                    }
                     if (hparams.dsv4_hc_mult == 0) {
                         throw std::runtime_error("DeepSeek-V4 hyper_connection.count is missing and could not be inferred");
                     }
@@ -2200,6 +2432,12 @@ void llm_load_hparams(
                     if (!hparams.dflash_dsv4) {
                         throw std::runtime_error("dflash: hyper_connection.count is required for the official DSV4 schema");
                     }
+                    // a V4.1 draft lags its hyper-connection mixes and collapses the output with the last
+                    // FFN's mix, as the body does; the absence of output_hc_base.weight is the signature
+                    hparams.dflash_dsv41 = ml.get_tensor_meta("output_hc_base.weight") == nullptr;
+                    hparams.dflash_block_bidir = hparams.dflash_dsv41;
+                    LLAMA_LOG_INFO("%s: DSV4 draft flavor = %s\n", __func__,
+                            hparams.dflash_dsv41 ? "V4.1 (lagged hyper-connections, no output head)" : "V4");
 
                     ml.get_key("dflash.block_size", hparams.dflash_block_size, true);
                     ml.get_key(LLM_KV_TOKENIZER_MASK_ID, hparams.dflash_mask_token_id, true);
@@ -2224,6 +2462,123 @@ void llm_load_hparams(
                         }
                     }
                     validate_dflash_hparams(hparams, model.arch);
+                }
+            } break;
+        case LLM_ARCH_GLM5NEXT:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                // The DSA lightning-indexer k_norm is a plain (non-RMS) LayerNorm built via
+                // LLM_NORM, which uses hparams.f_norm_eps in ggml_norm(). The GGUF only carries
+                // the RMS eps, so mirror it as the DEEPSEEK4/GLM_DSA blocks do.
+                if (hparams.f_norm_eps <= 0.0f) {
+                    ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS, hparams.f_norm_eps, false);
+                    if (hparams.f_norm_eps <= 0.0f) {
+                        hparams.f_norm_eps = hparams.f_norm_rms_eps;
+                    }
+                }
+
+                // The NextN/MTP block is appended after the trunk; trunk-only GGUFs still load
+                ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
+                // believe the tensors: a stale count hides the last real layer
+                if (hparams.nextn_predict_layers > 0) {
+                    const std::string probe = LLM_TN(LLM_ARCH_GLM5NEXT)(LLM_TENSOR_NEXTN_EH_PROJ, "weight",
+                            hparams.n_layer - hparams.nextn_predict_layers);
+                    if (ml.get_tensor_meta(probe.c_str()) == nullptr) {
+                        hparams.nextn_predict_layers = 0;
+                    }
+                }
+
+                // MLA. GLM-5.3-Flash is nope-only (rope.dimension_count == 0), so n_rot stays 0 and
+                // the whole q head is the NoPE part
+                ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,      hparams.n_lora_q);
+                ml.get_key(LLM_KV_ATTENTION_KV_LORA_RANK,     hparams.n_lora_kv);
+                ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_MLA,   hparams.n_embd_head_k_full);
+                ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, hparams.n_embd_head_v_full);
+
+                // MoE with shared experts; GLM-5.3-Flash uses sigmoid gating
+                ml.get_key(LLM_KV_EXPERT_COUNT,                hparams.n_expert);
+                ml.get_key(LLM_KV_EXPERT_USED_COUNT,           hparams.n_expert_used);
+                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared, false);
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp);
+                ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
+                if (hparams.n_ff_shexp == 0 && hparams.n_expert_shared > 0) {
+                    hparams.n_ff_shexp = hparams.n_ff_exp;
+                }
+                ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,   hparams.n_layer_dense_lead, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm, false);
+                ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func, false);
+                if (hparams.expert_gating_func == LLM_EXPERT_GATING_FUNC_TYPE_NONE) {
+                    hparams.expert_gating_func = LLM_EXPERT_GATING_FUNC_SIGMOID;
+                }
+                // clamped SwiGLU (gate clamped before the SiLU, deepseek4 semantics)
+                ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP,     hparams.swiglu_limits,        hparams.n_layer, false);
+                if (!ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_SHEXP, hparams.swiglu_limits_shared, hparams.n_layer, false)) {
+                    hparams.swiglu_limits_shared = hparams.swiglu_limits;
+                }
+
+                // DSA k-pool indexer. Absent in a GGUF without indexer weights, which then
+                // runs dense MLA; indexer_block_size (kpool) is the tokens-per-compressed-key cell
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head,    false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size, false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k,     false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_KPOOL,      hparams.indexer_block_size, false);
+                if (hparams.indexer_head_size > 0) {
+                    GGML_ASSERT(hparams.indexer_n_head > 0 && "GLM5NEXT indexer key length without indexer head count");
+                    if (hparams.indexer_block_size > 0 && hparams.indexer_top_k > 0 &&
+                            hparams.indexer_top_k % hparams.indexer_block_size != 0) {
+                        LLAMA_LOG_WARN("%s: indexer.top_k (%u) is not a multiple of indexer.kpool (%u); top-k will be clamped to whole pools\n",
+                                __func__, hparams.indexer_top_k, hparams.indexer_block_size);
+                    }
+                }
+
+                // hyper-connections (mHC) wrap every trunk attention/FFN block
+                ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT, hparams.dsv4_hc_mult);
+                ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters);
+                if (!ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON, hparams.dsv4_hc_eps, false)) {
+                    hparams.dsv4_hc_eps = hparams.f_norm_rms_eps;
+                }
+                if (hparams.dsv4_hc_mult == 0) {
+                    throw std::runtime_error("GLM5NEXT: hyper_connection.count is required");
+                }
+                if (hparams.dsv4_hc_sinkhorn_iters == 0) {
+                    throw std::runtime_error("GLM5NEXT: hyper_connection.sinkhorn_iterations is required");
+                }
+
+                // KDA (kimi-k3 low-rank parameterization on the KDA layers)
+                ml.get_key(LLM_KV_SSM_CONV_KERNEL, hparams.ssm_d_conv);
+                ml.get_key(LLM_KV_KDA_HEAD_DIM, hparams.ssm_d_state, false);
+                if (hparams.ssm_d_state == 0) {
+                    // older converters store the KDA head dim as ssm.state_size
+                    ml.get_key(LLM_KV_SSM_STATE_SIZE, hparams.ssm_d_state);
+                }
+                ml.get_key(LLM_KV_KDA_GATE_LOWER_BOUND, hparams.kda_gate_lower_bound, false);
+                if (hparams.kda_gate_lower_bound == 0.0f) {
+                    hparams.kda_gate_lower_bound = -5.0f;
+                }
+                GGML_ASSERT(hparams.kda_gate_lower_bound < 0.0f && "GLM5NEXT: only the bounded sigmoid gate is implemented");
+                hparams.ssm_dt_rank = hparams.n_head();
+                // no ssm.inner_size key in the GGUF: d_inner = head_dim * num_heads
+                hparams.ssm_d_inner = hparams.ssm_d_state * hparams.ssm_dt_rank;
+                // ssm_n_group (num KDA heads) is not in the GGUF; derive from n_head like bailingmoe3
+                if (!ml.get_key(LLM_KV_SSM_GROUP_COUNT, hparams.ssm_n_group, false)) {
+                    hparams.ssm_n_group = hparams.n_head();
+                }
+
+                // per-layer head_count_kv array: 0 marks the KDA (linear-attention) layers, 1 the MLA
+                for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                    hparams.recurrent_layer_arr[il] = hparams.n_head_kv_arr[il] == 0;
+                }
+                // unlike GLM-5.2 IndexShare, every MLA layer computes its own DSA top-k
+                for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                    hparams.indexer_is_full[il] = !hparams.recurrent_layer_arr[il];
+                }
+
+                hparams.n_layer_kv_from_start = hparams.n_layer - hparams.nextn_predict_layers;
+
+                switch (hparams.n_layer - hparams.nextn_predict_layers) {
+                    case 45: model.type = e_model::MODEL_312B_A17B; break; // GLM-5.3-Flash
+                    default: model.type = e_model::MODEL_UNKNOWN;
                 }
             } break;
         case LLM_ARCH_MUSE_GLIMMER:

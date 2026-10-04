@@ -60,9 +60,7 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
 
 bool common_speculative_needs_checkpoint(const llama_model * model) {
     return model != nullptr &&
-        (llama_model_has_recurrent(model) ||
-         llama_model_is_openpangu(model) ||
-         llama_model_is_deepseek4(model));
+        llama_model_has_recurrent(model);
 }
 
 void common_speculative_checkpoint::clear() {
@@ -1252,6 +1250,15 @@ enum common_speculative_type common_speculative_type_from_name(const std::string
 bool common_speculative_is_compat(llama_context * ctx_tgt) {
     bool res = true;
 
+    const llama_model * model = llama_get_model(ctx_tgt);
+    if (model != nullptr) {
+        const std::string arch = llama_model_arch_string(model);
+        if (arch == "lfm2" || arch == "lfm2moe") {
+            LOG_WRN("%s: speculative decoding is not supported for LFM2 models (shortconv recurrent state is not rolled back)\n", __func__);
+            return false;
+        }
+    }
+
     llama_kv_cache_clear(ctx_tgt);
 
     // eval 2 tokens to check if the context is compatible
@@ -1365,6 +1372,12 @@ common_speculative * common_speculative_init(
 
             cparams_dft.n_ctx = (uint32_t) effective_draft_ctx;
             cparams_dft.dflash_query_capacity = query_capacity;
+        }
+
+        if (!has_dflash_stage && !llama_model_share_qwen4exp_mtp_tensors(
+                    params.model_dft, llama_get_model(ctx_tgt))) {
+            LOG_ERR("%s: failed to share target IO tensors with the qwen4exp shared MTP companion\n", __func__);
+            return nullptr;
         }
 
         ctx_dft = llama_init_from_model(params.model_dft, cparams_dft);
@@ -2009,16 +2022,6 @@ bool common_speculative_load_draft_model(
     params_dft.cache_type_v     = params.cache_type_v.empty() ? params_base.cache_type_v : params.cache_type_v;
 
 
-    if (!params.params.empty()) {
-        auto [argc, argv] = parse_command_line("llama-server " + params.params);
-        if (!gpt_params_parse(argc, argv, params_dft)) {
-            gpt_params_print_usage(argc, argv, params_dft);
-            free_command_line(argc, argv);
-            return false;
-        }
-        free_command_line(argc, argv);
-    }
-
     // We likely don't want to inherit offload policy for MTP
     if (params.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP)) {
         params_dft.ncmoe = 0;
@@ -2026,6 +2029,28 @@ bool common_speculative_load_draft_model(
         params_dft.offload_policy.clear();
         LOG_INF("%s: MTP draft ignores target CPU-MoE/tensor placement overrides\n",
                 __func__);
+    }
+
+    if (!params.params.empty()) {
+        while (!params_dft.kv_overrides.empty() && params_dft.kv_overrides.back().key[0] == 0) {
+            params_dft.kv_overrides.pop_back();
+        }
+        while (!params_dft.tensor_buft_overrides.empty() && params_dft.tensor_buft_overrides.back().pattern == nullptr) {
+            params_dft.tensor_buft_overrides.pop_back();
+        }
+        while (params_dft.fit_margin_array.size() >= 2 &&
+                params_dft.fit_margin_array[params_dft.fit_margin_array.size()-2] == -1 &&
+                params_dft.fit_margin_array.back() == 0) {
+            params_dft.fit_margin_array.pop_back();
+            params_dft.fit_margin_array.pop_back();
+        }
+        auto [argc, argv] = parse_command_line("llama-server " + params.params);
+        if (!gpt_params_parse(argc, argv, params_dft)) {
+            gpt_params_print_usage(argc, argv, params_dft);
+            free_command_line(argc, argv);
+            return false;
+        }
+        free_command_line(argc, argv);
     }
 
     LOG_INF("%s: loading draft model '%s'\n", __func__, params_dft.model.c_str());
@@ -2052,6 +2077,9 @@ bool common_speculative_load_draft_model(
 
     params.model_dft = loaded_model;
     params.cparams_dft = common_context_params_to_llama(params_dft);
+    // params_dft is a local copy: point the affinity at params_base, which outlives it
+    params.cparams_dft.cpu_affinity   = params_base.cpu_affinity.empty() ? nullptr : params_base.cpu_affinity.data();
+    params.cparams_dft.n_cpu_affinity = (int32_t) params_base.cpu_affinity.size();
     return true;
 }
 
@@ -2098,6 +2126,9 @@ bool common_speculative_prepare_mtp_runtime(
         // in lockstep (tail layers are never compacted, so compaction is dormant here —
         // but the allocation win applies and the layouts must not diverge).
         params.cparams_dft.swa_compress = params_base.swa_compress;
+        // params_mtp is a local copy: point the affinity at params_base, which outlives it
+        params.cparams_dft.cpu_affinity   = params_base.cpu_affinity.empty() ? nullptr : params_base.cpu_affinity.data();
+        params.cparams_dft.n_cpu_affinity = (int32_t) params_base.cpu_affinity.size();
     }
 
     params.cparams_dft.mtp         = true;

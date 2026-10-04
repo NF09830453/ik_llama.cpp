@@ -44,7 +44,6 @@ struct server_slot {
     int32_t n_ctx = 0;  // context size per slot
     int32_t n_past = 0;
     int32_t n_past_prompt = 0;
-    int32_t n_past_offset = 0;
     int32_t n_decoded = 0;
     int32_t n_remaining = -1;
     int32_t n_discarded_prompt = 0;
@@ -65,7 +64,7 @@ struct server_slot {
     server_tokens prompt_tokens;
     server_tokens cache_tokens;
 
-    int32_t last_gentxt_size = 0;
+    int32_t last_gentxt_len = 0;
     std::string generated_text;
 
     // idx of draft tokens in the main batch
@@ -381,6 +380,8 @@ struct server_context {
 
     void send_token_results(completion_token_outputs& results, server_slot& slot, int32_t n = 0);
 
+    void rewind_context(server_slot& slot, int32_t ban_pos);
+
     void buffer_and_check_string_ban(server_slot& slot, completion_token_output& result);
 
     void update_allowlist_state(server_slot& slot);
@@ -390,7 +391,7 @@ struct server_context {
     // Re-aggregates all active vectors and updates the model state
     bool apply_control_vectors_internal();
 
-    bool create_checkpoint(server_slot & slot);
+    bool create_checkpoint(server_slot & slot, bool prompt_end = false);
 
     void apply_checkpoint(server_slot & slot);
 

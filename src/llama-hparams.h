@@ -33,6 +33,7 @@ struct llama_hparams {
     uint32_t n_rot_swa;
     uint32_t n_swa = 0; // sliding window attention (SWA)
     uint32_t n_swa_pattern = 1; // by default, all layers use non-sliding-window attention
+    bool     swa_full_non_causal = false; // DSV4 vision: in a non-causal (image) span, window only clips older tokens
     uint32_t n_embd_head_k_full; // dimension of keys (d_k). d_q is assumed to be the same, but there are n_head q heads, and only n_head_kv k-v heads
     uint32_t n_embd_head_v_full; // dimension of values (d_v) aka n_embd_head
     uint32_t n_embd_head_k_swa;
@@ -52,6 +53,10 @@ struct llama_hparams {
     uint32_t n_ff_exp           = 0;
     uint32_t n_ff_shexp         = 0;
     uint32_t n_expert_shared    = 0;
+    // K2 Horizon MoVA
+    uint32_t n_value_expert      = 0;
+    uint32_t n_value_expert_used = 0;
+
     uint32_t n_norm_groups      = 0;
     uint32_t n_expert_groups    = 0;
     uint32_t n_group_used       = 0;
@@ -91,6 +96,9 @@ struct llama_hparams {
     std::array<uint32_t, LLAMA_MAX_LAYERS> rope_dim_per_layer;
 
     // for State Space Models
+    // LFM2 short-convolution state length (including the current token).
+    uint32_t n_shortconv_l_cache = 0;
+
     uint32_t ssm_d_conv  = 0;
     uint32_t ssm_d_inner = 0;
     uint32_t ssm_d_state = 0;
@@ -136,6 +144,8 @@ struct llama_hparams {
     // converter does not emit as GGUF keys (converter patch deferred, AGENTS.md Step A)
     uint32_t indexer_rope_dim  = 0; // sparse_config.sparse_indexer_rope_dim (32)
     uint32_t indexer_csa_block = 0; // sparse_config.region_block_size (8): CSA block-compress
+    // k-pool indexer: tokens per compressed key cell (GGUF attention.indexer.kpool); 0 = plain per-token DSA (as in GLM-5.2)
+    uint32_t indexer_block_size = 0;
     // GLM-5.2 IndexShare: per-layer full/shared indexer map. "full" layers compute their own lightning-
     // indexer top-k; "shared" layers reuse the previous full layer's top-k. Populated from GGUF
     // indexer_types metadata if present, else derived from the GLM-5.2 config rule at load time.
@@ -157,6 +167,51 @@ struct llama_hparams {
     float    dsv4_compress_rope_base = 0.0f;
     float    dsv4_hc_eps             = 0.0f;
     std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios = {};
+
+    // The two compressed-stream plan slots. V4 hardcodes 4 (overlapping groups) and 128;
+    // V4.1 takes both ratios from the file and pools disjoint groups in both.
+    uint32_t dsv4_csa_ratio   = 4;
+    uint32_t dsv4_hca_ratio   = 128;
+    bool     dsv4_csa_overlap = true;
+    bool     dsv4_hca_overlap = false;
+
+    // DeepSeek-V4.1: only a few source layers compress, and the layers after each one read the
+    // same rows. For every layer these hold the layer that published what it reads, or -1. A
+    // layer whose entry is itself is a source. Index keys and the indexer top-k are shared the
+    // same way on their own sets of layers.
+    bool dsv4_shared_streams = false;
+    // V4.1: the hyper-connection mix a sublayer computes is applied by the next one, and the
+    // last FFN's mix collapses the output (no learned output head). V4 uses the same mix
+    // twice and has a head.
+    bool dsv4_hc_lag = false;
+    // V4 re-normalizes every attention head after the up projection; V4.1 normalizes only the
+    // low-rank query and the latent kv.
+    bool dsv4_q_head_norm = true;
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_kv_source        = {};
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_index_key_source = {};
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_topk_source      = {};
+
+    int32_t  dsv4_candidate_source_layer = -1;
+    uint32_t dsv4_candidate_block_size   = 0;
+    uint32_t dsv4_candidate_topk_blocks  = 0;
+    bool dsv41_is_kv_source   (uint32_t il) const { return dsv4_shared_streams && dsv41_kv_source[il]        == (int32_t) il; }
+    bool dsv41_owns_index_k   (uint32_t il) const { return dsv4_shared_streams && dsv41_index_key_source[il] == (int32_t) il; }
+    bool dsv41_is_index_source(uint32_t il) const { return dsv4_shared_streams && dsv41_topk_source[il]      == (int32_t) il; }
+
+    // DeepSeek-V4.1 engram: n-gram keyed tables added into the stream at a few layers
+    uint32_t engram_n_head         = 0;
+    uint32_t engram_key_length     = 0;
+    uint32_t engram_max_ngram_size = 0;
+    uint32_t engram_n_layer        = 0;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> engram_layer_ids = {};
+
+    // which engram table layer il carries, or -1
+    int engram_index(uint32_t il) const {
+        for (uint32_t e = 0; e < engram_n_layer; ++e) {
+            if (engram_layer_ids[e] == il) return (int) e;
+        }
+        return -1;
+    }
 
     // qwen4exp. hc_low_rank 0 means the full-rank hyper-connection form; the
     // ple_* group is inert unless the model carries an n-gram embedding layer.
@@ -198,6 +253,11 @@ struct llama_hparams {
     float    dflash_backbone_rotary_base = 0.0f;
     bool     dflash_laguna = false;
     bool     dflash_dsv4 = false;
+    bool     dflash_dsv41 = false;  // DSV4 draft with V4.1 rules: lagged hyper-connections, no output head
+    // DSpark proposal blocks attend bidirectionally within the block and to one fixed window
+    // of the last n_swa committed positions (reference get_dspark_topk_idxs); other drafts
+    // keep the causal, per-row sliding mask
+    bool     dflash_block_bidir = false;
 
     // needed by encoder-decoder models (e.g. T5, FLAN-T5)
     // ref: https://github.com/ggerganov/llama.cpp/pull/8141
@@ -228,6 +288,8 @@ struct llama_hparams {
         if (this->dflash_selector_top_k != other.dflash_selector_top_k) return true;
         if (this->dflash_laguna != other.dflash_laguna) return true;
         if (this->dflash_dsv4   != other.dflash_dsv4)   return true;
+        if (this->dflash_dsv41  != other.dflash_dsv41)  return true;
+        if (this->dflash_block_bidir != other.dflash_block_bidir) return true;
         if (this->n_layer       != other.n_layer)       return true;
         if (this->n_rot         != other.n_rot)         return true;
         if (this->n_swa         != other.n_swa)         return true;
@@ -248,10 +310,13 @@ struct llama_hparams {
         if (this->n_ff_exp           != other.n_ff_exp)           return true;
         if (this->n_ff_shexp         != other.n_ff_shexp)         return true;
         if (this->n_expert_shared    != other.n_expert_shared)    return true;
+        if (this->n_value_expert      != other.n_value_expert)      return true;
+        if (this->n_value_expert_used != other.n_value_expert_used) return true;
 
         if (this->rope_finetuned  != other.rope_finetuned)  return true;
         if (this->n_ctx_orig_yarn != other.n_ctx_orig_yarn) return true;
 
+        if (this->n_shortconv_l_cache != other.n_shortconv_l_cache) return true;
         if (this->ssm_d_conv  != other.ssm_d_conv)  return true;
         if (this->ssm_d_inner != other.ssm_d_inner) return true;
         if (this->ssm_d_state != other.ssm_d_state) return true;
@@ -356,6 +421,9 @@ struct llama_hparams {
     }
 
     uint32_t n_embd_v_s() const { // dimension of the recurrent state embeddings
+        if (n_shortconv_l_cache > 0) {
+            return (n_shortconv_l_cache - 1) * n_embd;
+        }
         if (ssm_n_group > 0) {
             // qwen3next recurrent state packs:
             // 1) conv state: (d_conv - 1) * (2 * key_dim + value_dim)
@@ -417,6 +485,31 @@ struct llama_hparams {
 
     uint32_t ple_conv_state() const {
         return ple_conv_kernel > 0 ? (ple_conv_kernel - 1) * ple_ngram_size : 0;
+    }
+
+    struct recurrent_state_layout {
+        uint32_t conv_width;
+        uint32_t conv_feature_width;
+        uint32_t ssm_width;
+        uint32_t ple_offset;
+        uint32_t ple_width;
+        uint32_t row_width;
+        bool has_ple;
+    };
+
+    recurrent_state_layout recurrent_state_layout_for(uint32_t il) const {
+        const auto [conv_dim, ssm_width] = n_embd_v_s_dims(ssm_dt_rank);
+        const uint32_t conv_width = (ssm_d_conv > 0 ? ssm_d_conv - 1 : 0) * conv_dim;
+        const uint32_t ple_width = n_embd_ple_conv(il);
+        return {
+            conv_width,
+            conv_dim,
+            ssm_width,
+            conv_width + ssm_width,
+            ple_width,
+            conv_width + ssm_width + ple_width,
+            ple_width > 0,
+        };
     }
 
     static bool is_float_close(float a, float b, float abs_tol) {

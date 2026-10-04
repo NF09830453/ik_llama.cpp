@@ -13,7 +13,7 @@ from typing import Any, Literal, NamedTuple, TypeVar, Union
 import numpy as np
 import numpy.typing as npt
 
-from .quants import quant_shape_to_byte_shape
+from .quants import quant_shape_to_byte_shape, quant_row_bytes
 
 if __name__ == "__main__":
     from pathlib import Path
@@ -22,7 +22,6 @@ if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from gguf.constants import (
-    GGML_QUANT_SIZES,
     GGUF_DEFAULT_ALIGNMENT,
     GGUF_MAGIC,
     GGUF_VERSION,
@@ -325,8 +324,8 @@ class GGUFReader:
             ggml_type = GGMLQuantizationType(raw_dtype[0])
             n_elems = int(np.prod(dims))
             np_dims = tuple(reversed(dims.tolist()))
-            block_size, type_size = GGML_QUANT_SIZES[ggml_type]
-            n_bytes = n_elems * type_size // block_size
+            n_rows = n_elems // int(dims[0]) if n_elems > 0 else 0
+            n_bytes = quant_row_bytes(np_dims[-1], ggml_type) * n_rows
             data_offs = int(start_offs + offset_tensor[0])
             item_type: npt.DTypeLike
             if ggml_type == GGMLQuantizationType.F16:

@@ -42,6 +42,7 @@ class TensorNameMap:
             "embeddings.LayerNorm",       # bert
             "emb_ln",                     # nomic-bert
             "transformer.norm",           # openelm
+            "model.embedding_norm",       # lfm2
         ),
 
         # Position embeddings
@@ -135,6 +136,7 @@ class TensorNameMap:
             "transformer.blocks.{bid}.norm_attn_norm.norm_1",       # dbrx
             "encoder.layers.{bid}.input_layernorm",                 # chatglm
             "transformer.layers.{bid}.attn_norm",                   # openelm
+            "model.layers.{bid}.operator_norm",                    # lfm2
         ),
 
         # Attention norm 2
@@ -206,6 +208,7 @@ class TensorNameMap:
             "transformer.h.{bid}.self_attention.dense",                     # falcon
             "h.{bid}.self_attention.dense",                                 # bloom
             "model.layers.{bid}.self_attn.o_proj",                          # llama-hf nemotron olmoe olmo2
+            "model.layers.{bid}.self_attn.out_proj",                         # lfm2
             "model.layers.{bid}.self_attn.linear_attn",                     # deci
             "layers.{bid}.attention.wo",                                    # llama-pth
             "encoder.layer.{bid}.attention.output.dense",                   # bert
@@ -297,6 +300,7 @@ class TensorNameMap:
             "transformer.decoder_layer.{bid}.router",     # Grok
             "transformer.blocks.{bid}.ffn.router.layer",  # dbrx
             "model.layers.{bid}.moe.gate",                # step35
+            "model.layers.{bid}.feed_forward.gate",       # lfm2moe
         ),
 
         MODEL_TENSOR.FFN_GATE_INP_SHEXP: (
@@ -311,6 +315,7 @@ class TensorNameMap:
             "model.layers.{bid}.mlp.experts.e_score_correction_bias",   # laguna
             "model.layers.{bid}.mlp.experts.e_score_correction",        # laguna
             "model.layers.{bid}.moe.router_bias",                       # step35
+            "model.layers.{bid}.feed_forward.expert_bias",              # lfm2moe
         ),
 
         # Feed-forward up
@@ -352,6 +357,7 @@ class TensorNameMap:
         MODEL_TENSOR.FFN_GATE_UP_EXP: (
             "model.layers.{bid}.mlp.experts.gate_up_proj", # gemma4
             "model.layers.{bid}.experts.gate_up_proj",     # gemma4
+            "model.layers.{bid}.feed_forward.experts.gate_up_proj",  # lfm2moe (fused experts)
         ),
 
         MODEL_TENSOR.FFN_UP_SHEXP: (
@@ -426,6 +432,7 @@ class TensorNameMap:
             "transformer.blocks.{bid}.ffn.experts.mlp.w2",   # dbrx
             "model.layers.{bid}.mlp.experts.down_proj",      # qwen2moe (merged)
             "model.layers.{bid}.moe.down_proj",              # step35
+            "model.layers.{bid}.feed_forward.experts.down_proj",  # lfm2moe (fused experts)
         ),
 
         MODEL_TENSOR.FFN_DOWN_SHEXP: (
@@ -442,6 +449,7 @@ class TensorNameMap:
             "encoder.layer.{bid}.attention.self.layer_norm_q",                # jina-bert-v2
             "transformer.layers.{bid}.attn.q_norm",                           # openelm
             "model.layers.{bid}.attention.query_layernorm",                   # bailingmoe2
+            "model.layers.{bid}.self_attn.q_norm",                   # lfm2
         ),
 
         MODEL_TENSOR.ATTN_K_NORM: (
@@ -452,6 +460,7 @@ class TensorNameMap:
             "encoder.layer.{bid}.attention.self.layer_norm_k",                # jina-bert-v2
             "transformer.layers.{bid}.attn.k_norm",                           # openelm
             "model.layers.{bid}.attention.key_layernorm",                     # bailingmoe2
+            "model.layers.{bid}.self_attn.k_norm",                   # lfm2
         ),
 
         MODEL_TENSOR.ATTN_SINKS: (
@@ -510,6 +519,18 @@ class TensorNameMap:
 
         MODEL_TENSOR.PER_LAYER_POST_NORM: (
             "model.layers.{bid}.post_per_layer_input_norm", # gemma4
+        ),
+
+        MODEL_TENSOR.SHORTCONV_CONV: (
+            "model.layers.{bid}.conv.conv",                  # lfm2
+        ),
+
+        MODEL_TENSOR.SHORTCONV_INPROJ: (
+            "model.layers.{bid}.conv.in_proj",               # lfm2
+        ),
+
+        MODEL_TENSOR.SHORTCONV_OUTPROJ: (
+            "model.layers.{bid}.conv.out_proj",              # lfm2
         ),
 
         MODEL_TENSOR.SSM_IN: (

@@ -17,6 +17,7 @@
 #include "chat.h"
 #include "json-schema-to-grammar.h"
 #include <algorithm>
+#include <cerrno>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -391,19 +392,28 @@ get_env(std::string name, T & target) {
 // CPU utils
 //
 
+#ifdef __linux__
+static std::string cpu_physical_core_key(int cpu) {
+    std::ifstream thread_siblings("/sys/devices/system/cpu/cpu"
+        + std::to_string(cpu) + "/topology/thread_siblings_list");
+    std::string line;
+    if (!std::getline(thread_siblings, line)) {
+        return {};
+    }
+    return line;
+}
+#endif
+
 int32_t cpu_get_num_physical_cores() {
 #ifdef __linux__
     // enumerate the set of thread siblings, num entries is num cores
     std::unordered_set<std::string> siblings;
-    for (uint32_t cpu=0; cpu < UINT32_MAX; ++cpu) {
-        std::ifstream thread_siblings("/sys/devices/system/cpu/cpu"
-            + std::to_string(cpu) + "/topology/thread_siblings");
-        if (!thread_siblings.is_open()) {
-            break; // no more cpus
-        }
-        std::string line;
-        if (std::getline(thread_siblings, line)) {
-            siblings.insert(line);
+    const long n_cpu_conf = sysconf(_SC_NPROCESSORS_CONF);
+    const int  n_cpu      = n_cpu_conf > 0 ? (int) std::min((long) CPU_SETSIZE, n_cpu_conf) : (int) CPU_SETSIZE;
+    for (int cpu = 0; cpu < n_cpu; ++cpu) {
+        const std::string key = cpu_physical_core_key(cpu);
+        if (!key.empty()) { // skip cpus with no topology (offline / holes)
+            siblings.insert(key);
         }
     }
     if (!siblings.empty()) {
@@ -460,21 +470,101 @@ static bool is_running_on_efficiency_core(void) {
     return core_type == intel_atom;
 }
 
-static int cpu_count_math_cpus(int n_cpu) {
-    int result = 0;
+struct cpu_affinity_restore {
+    cpu_set_t prev;
+    bool      active = false;
+
+    ~cpu_affinity_restore() {
+        if (active) {
+            pthread_setaffinity_np(pthread_self(), sizeof(prev), &prev);
+        }
+    }
+};
+
+// P-cores: primaries first, then the extra SMT siblings (for n_threads overflow)
+static std::vector<int32_t> cpu_detect_math_cpus(bool with_siblings) {
+    std::vector<int32_t> primaries;
+    std::vector<int32_t> extra;
+
+    int n_cpu = sysconf(_SC_NPROCESSORS_CONF); // covers holes from offline cpus
+    if (n_cpu < 1 || !is_hybrid_cpu()) {
+        return primaries;
+    }
+    n_cpu = std::min(n_cpu, (int) CPU_SETSIZE);
+
+    cpu_affinity_restore restore;
+    if (pthread_getaffinity_np(pthread_self(), sizeof(restore.prev), &restore.prev)) {
+        return primaries;
+    }
+    restore.active = true;
+
+    const cpu_set_t & affinity = restore.prev;
+
+    std::unordered_set<std::string> seen;
     for (int cpu = 0; cpu < n_cpu; ++cpu) {
+        if (!CPU_ISSET(cpu, &affinity)) { // stay within the affinity we were started with
+            continue;
+        }
         if (pin_cpu(cpu)) {
-            return -1;
+            primaries.clear();
+            extra.clear();
+            break;
         }
         if (is_running_on_efficiency_core()) {
             continue; // efficiency cores harm lockstep threading
         }
-        ++cpu; // hyperthreading isn't useful for linear algebra
-        ++result;
+
+        const std::string key = cpu_physical_core_key(cpu);
+        if (key.empty()) {
+            continue; // cannot tell siblings apart, better skip than double count
+        }
+        if (seen.insert(key).second) {
+            primaries.push_back(cpu);
+        } else if (with_siblings) {
+            extra.push_back(cpu);
+        }
+    }
+
+    primaries.insert(primaries.end(), extra.begin(), extra.end());
+    return primaries;
+}
+
+std::vector<int32_t> cpu_get_math_cpus() {
+    static const std::vector<int32_t> cpus = cpu_detect_math_cpus(false);
+    return cpus;
+}
+
+static std::vector<int32_t> cpu_affinity_auto_cpus() {
+    static const std::vector<int32_t> cpus = cpu_detect_math_cpus(true);
+    return cpus;
+}
+
+// drop CPUs outside the process affinity (taskset/cgroup)
+static std::vector<int32_t> cpu_affinity_filter(const std::vector<int32_t> & cpus) {
+    if (cpus.empty()) {
+        return cpus;
+    }
+
+    cpu_set_t affinity;
+    if (pthread_getaffinity_np(pthread_self(), sizeof(affinity), &affinity)) {
+        return cpus;
+    }
+
+    std::vector<int32_t> result;
+    for (const int32_t cpu : cpus) {
+        if (cpu >= 0 && cpu < CPU_SETSIZE && CPU_ISSET(cpu, &affinity)) {
+            result.push_back(cpu);
+        } else {
+            fprintf(stderr, "warning: CPU %d is outside the process affinity, ignored\n", cpu);
+        }
     }
     return result;
 }
 
+#else
+std::vector<int32_t> cpu_get_math_cpus() { return {}; }
+static std::vector<int32_t> cpu_affinity_auto_cpus() { return {}; }
+static std::vector<int32_t> cpu_affinity_filter(const std::vector<int32_t> & cpus) { return cpus; }
 #endif // __x86_64__ && __linux__
 
 /**
@@ -482,22 +572,98 @@ static int cpu_count_math_cpus(int n_cpu) {
  */
 int32_t cpu_get_num_math() {
 #if defined(__x86_64__) && defined(__linux__) && !defined(__ANDROID__)
-    int n_cpu = sysconf(_SC_NPROCESSORS_ONLN);
-    if (n_cpu < 1) {
-        return cpu_get_num_physical_cores();
-    }
-    if (is_hybrid_cpu()) {
-        cpu_set_t affinity;
-        if (!pthread_getaffinity_np(pthread_self(), sizeof(affinity), &affinity)) {
-            int result = cpu_count_math_cpus(n_cpu);
-            pthread_setaffinity_np(pthread_self(), sizeof(affinity), &affinity);
-            if (result > 0) {
-                return result;
-            }
-        }
+    const std::vector<int32_t> cpus = cpu_get_math_cpus();
+    if (!cpus.empty()) {
+        return (int32_t) cpus.size();
     }
 #endif
     return cpu_get_num_physical_cores();
+}
+
+std::vector<int32_t> cpu_affinity_resolve(const std::vector<int32_t> & cpus, bool auto_detect) {
+    const std::vector<int32_t> resolved = (!cpus.empty() || !auto_detect) ? cpus : cpu_affinity_auto_cpus();
+    return cpu_affinity_filter(resolved);
+}
+
+// Parse a CPU bitmask ("0x55", "85") into a list of logical CPU ids.
+bool cpu_affinity_parse_mask(const std::string & value, std::vector<int32_t> & cpus) {
+    if (value.find('-') != std::string::npos) {
+        return false; // strtoull would wrap a negative value to ULLONG_MAX
+    }
+
+    errno = 0;
+    char * end = nullptr;
+    const unsigned long long mask = strtoull(value.c_str(), &end, 0);
+    if (errno == ERANGE || end == value.c_str() || *end != '\0') {
+        return false; // malformed or does not fit 64 CPUs
+    }
+
+    cpus.clear();
+    for (int i = 0; i < 64; ++i) {
+        if (mask & (1ull << i)) {
+            cpus.push_back(i);
+        }
+    }
+    return !cpus.empty();
+}
+
+// parse a non-negative decimal CPU id, without throwing
+static bool cpu_affinity_parse_id(const std::string & str, int & cpu) {
+    if (str.empty()) {
+        return false;
+    }
+
+    errno = 0;
+    char * end = nullptr;
+    const long value = strtol(str.c_str(), &end, 10);
+    if (errno != 0 || end == str.c_str() || *end != '\0' || value < 0 || value > INT_MAX) {
+        return false;
+    }
+
+    cpu = (int) value;
+    return true;
+}
+
+// Parse a CPU list ("0-3,8,10-11") into a list of logical CPU ids.
+bool cpu_affinity_parse_range(const std::string & value, std::vector<int32_t> & cpus) {
+    // bound to what the backend supports (also avoids absurd ranges)
+    const int max_cpu = GGML_MAX_CPU_AFFINITY;
+
+    std::vector<int32_t> result;
+    std::stringstream ss(value);
+    std::string item;
+
+    while (std::getline(ss, item, ',')) {
+        if (item.empty()) {
+            return false;
+        }
+
+        const size_t dash = item.find('-');
+        if (dash == std::string::npos) {
+            int cpu;
+            if (!cpu_affinity_parse_id(item, cpu) || cpu >= max_cpu) {
+                return false;
+            }
+            result.push_back(cpu);
+        } else {
+            int lo, hi;
+            if (!cpu_affinity_parse_id(item.substr(0, dash), lo) ||
+                !cpu_affinity_parse_id(item.substr(dash + 1), hi) ||
+                hi < lo || hi >= max_cpu) {
+                return false;
+            }
+            for (int cpu = lo; cpu <= hi; ++cpu) {
+                result.push_back(cpu);
+            }
+        }
+    }
+
+    if (result.empty()) {
+        return false;
+    }
+
+    cpus = std::move(result);
+    return true;
 }
 
 //
@@ -835,6 +1001,9 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
         params = params_org;
         return false;
     }
+
+    // resolve the CPU affinity once, so the list stays alive until the context is created
+    params.cpu_affinity = cpu_affinity_resolve(params.cpu_affinity, params.cpu_affinity_auto);
 
     return true;
 }
@@ -1939,8 +2108,16 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.fused_idx_topk = true;
         return true;
     }
+    if (arg == "-no-fidx" || arg == "--no-fused-indexer-topk") {
+        params.fused_idx_topk = false;
+        return true;
+    }
     if (arg == "--swa-compress") {
         params.swa_compress = true;
+        return true;
+    }
+    if (arg == "-dsv4ls" || arg == "--dsv4-legacy-state") {
+        params.dsv4_legacy_state = true;
         return true;
     }
     if (arg == "-dsatk" || arg == "--dsa-top-k") {
@@ -2182,6 +2359,31 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     }
     if (arg == "--defer-ple") {
         params.defer_ple = true;
+        return true;
+    }
+    if (arg == "--cpu-mask" || arg == "-cm") {
+        CHECK_ARG;
+        if (!cpu_affinity_parse_mask(argv[i], params.cpu_affinity)) {
+            fprintf(stderr, "error: invalid CPU mask '%s' for %s\n", argv[i], arg.c_str());
+            invalid_param = true;
+            return true;
+        }
+        params.cpu_affinity_auto = false;
+        return true;
+    }
+    if (arg == "--cpu-range" || arg == "-cr") {
+        CHECK_ARG;
+        if (!cpu_affinity_parse_range(argv[i], params.cpu_affinity)) {
+            fprintf(stderr, "error: invalid CPU range '%s' for %s\n", argv[i], arg.c_str());
+            invalid_param = true;
+            return true;
+        }
+        params.cpu_affinity_auto = false;
+        return true;
+    }
+    if (arg == "--cpu-affinity") {
+        params.cpu_affinity.clear();
+        params.cpu_affinity_auto = true;
         return true;
     }
     if (arg == "--prefetch-experts") {
@@ -2851,6 +3053,16 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.ctx_checkpoints_tolerance = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "--ctx-ckpt-spill-dir" || arg == "--ctx-checkpoints-spill-dir") {
+        CHECK_ARG
+        params.ctx_checkpoint_spill_dir = argv[i];
+        return true;
+    }
+    if (arg == "--ctx-ckpt-live-n" || arg == "--ctx-checkpoints-live-n") {
+        CHECK_ARG
+        params.ctx_checkpoint_ram_live = std::stoi(argv[i]);
+        return true;
+    }
     if (arg == "-ctx-ckpt-e" || arg == "--ctx-checkpoints-eviction") {
         CHECK_ARG
         params.ctx_checkpoint_eviction= common_checkpoint_eviction_from_name(std::string(argv[i]));
@@ -3065,6 +3277,8 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-cd,   --ctx-size-draft N",     "size of the prompt context for the draft model (default: %d, 0 = inherits target context for DFlash/DSpark, otherwise loaded from model)", params.speculative.n_ctx });
 
     options.push_back({ "*",           "-ctx-ckpt N, --ctx-checkpoints N",           "max number of context checkpoints to create per slot (default: %d)",params.ctx_checkpoints_n});
+    options.push_back({ "*",           "--ctx-ckpt-spill-dir DIR, --ctx-checkpoints-spill-dir DIR",           "spill evicted checkpoints to DIR (NVMe) instead of dropping them; empty disables"});
+    options.push_back({ "*",           "--ctx-ckpt-live-n N, --ctx-checkpoints-live-n N",           "max checkpoints with resident data when spill is on (default: %d)",params.ctx_checkpoint_ram_live});
     options.push_back({ "*",           "-ctx-ckpt-i N, --ctx-checkpoints-interval N",  "minimum number of tokens between each context checkpoint.  (default: %d, <=0 disable)",params.ctx_checkpoints_interval});
     options.push_back({ "*",           "-ctx-ckpt-t N, --ctx-checkpoints-tolerance N", "the number of tokens before the full prompt to create the checkpoint.  (default: %d, <=0 disable)",params.ctx_checkpoints_tolerance});
     options.push_back({ "*",           "-ctx-ckpt-e NAME, --ctx-checkpoints-eviction NAME", "Eviction strategy for checkpoint. Accepts fifo, variance and auto. Auto defaults to variance. Variance preserves coverage and maintains uniform interval.  (default: variance)" });
@@ -3081,7 +3295,9 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-mla,  --mla-use",              "enable MLA (default: %d)", params.mla_attn });
     options.push_back({ "*",           "-dsa,  --dsa",                  "enable GLM DSA sparse attention (GLM-DSA arch only; default: %s)", params.dsa ? "enabled" : "disabled" });
     options.push_back({ "*",           "-fidx,  --fused-indexer-topk",  "enable the fused indexer topk op (DSA only; default: %s)", params.fused_idx_topk ? "enabled" : "disabled" });
+    options.push_back({ "*",           "-no-fidx, --no-fused-indexer-topk", "disable the fused indexer topk op (DSA only; default: %s)", params.fused_idx_topk ? "enabled" : "disabled" });
     options.push_back({ "*",           "        --swa-compress",         "allocate sliding-window layers at window size instead of n_ctx (default: %s)", params.swa_compress ? "enabled" : "disabled" });
+    options.push_back({ "*",           "-dsv4ls, --dsv4-legacy-state",   "write DeepSeek-V4 state in the legacy full-slice layout, byte-identical to main (default: %d)", params.dsv4_legacy_state });
     options.push_back({ "*",           "-dsatk, --dsa-top-k",           "DSA top-k override; <0 uses the model's configured indexer_top_k (default: %d)", params.dsa_top_k });
     options.push_back({ "*",           "-amb,  --attention-max-batch",  "max batch size for attention computations (default: %d)", params.attn_max_batch});
     options.push_back({ "*",           "-no-fmoe, --no-fused-moe",      "disable fused MoE (default: %s)", params.fused_moe_up_gate ? "enabled" : "disabled" });
@@ -3310,10 +3526,13 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-ncmoe, --n-cpu-moe N",          "keep MoE weights of the first N layers in CPU memory"});
     options.push_back({ "*",           "-thp,   --transparent-huge-pages", "use transparent huge pages on Linux"});
     options.push_back({ "*",           "       --defer-experts",        "defer expert mmap residency on Linux to reduce model load time"});
-    options.push_back({ "*",           "       --defer-ple",            "keep the per-layer token embedding on the file instead of resident in memory (Linux)"});
+    options.push_back({ "*",           "       --defer-ple",            "keep the per-layer token embedding on the file instead of resident in memory (Linux, Windows)"});
     options.push_back({ "*",           "       --prefetch-experts",     "stream mmap'd MoE expert weights into the page cache on Linux"});
     options.push_back({ "*",           "       --prefetch-experts-threads N",
                                                                         "number of expert prefetch workers, tune to drive speed/type (default: auto)"});
+    options.push_back({ "*",           "       --cpu-affinity",          "pin CPU workers to the physical P-cores (hybrid CPUs only)"});
+    options.push_back({ "*",           "-cm,   --cpu-mask MASK",         "pin CPU workers to the logical CPUs set in MASK (hex or decimal bitmask, e.g. 0x55; 64 CPUs max, use --cpu-range for more)"});
+    options.push_back({ "*",           "-cr,   --cpu-range LIST",        "pin CPU workers to the given logical CPUs (e.g. 0-3,8,10-11)"});
     options.push_back({ "*",           "       --fit-margin N",         "safety margin in MiB when auto-fitting model offloading"});
     options.push_back({ "*",           "-gfm,  --gpu-fit-margin N",     "per-layer GPU fit margin as layer_id,margin pairs, comma-separated" });
     options.push_back({ "*",           "-wgt, --worst-graph-tokens N",  "number of tokens to use for worst-case graph"});
@@ -3827,6 +4046,15 @@ bool string_is_found(const std::string& window, const std::string& str, size_t& 
     return pos != std::string::npos;
 }
 
+void string_assign_append(std::string& dst, const std::string_view& sv, const std::string& str, const int32_t pos) {
+    const int32_t margin = SSIZE(sv) - pos;
+    if (margin > 0) {
+        dst.assign(sv, pos).append(str);
+    } else {
+        dst.assign(str, -margin);
+    }
+}
+
 //
 // Filesystem utils
 //
@@ -4079,6 +4307,15 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, params.model.c_str());
         llama_free_model(model);
         return iparams;
+    }
+
+    // the affinity itself is applied at context creation
+    if (!params.cpu_affinity.empty()) {
+        std::string cpus;
+        for (size_t i = 0; i < params.cpu_affinity.size(); ++i) {
+            cpus += (i == 0 ? "" : ",") + std::to_string(params.cpu_affinity[i]);
+        }
+        LOG_INF("%s: pinning CPU worker threads to logical CPUs: %s\n", __func__, cpus.c_str());
     }
 
     for (auto [op, on_off] : params.offload_policy) {
@@ -4340,6 +4577,8 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.n_ubatch          = n_ubatch;
     cparams.n_threads         = params.n_threads;
     cparams.n_threads_batch   = params.n_threads_batch == -1 ? params.n_threads : params.n_threads_batch;
+    cparams.cpu_affinity      = params.cpu_affinity.empty() ? nullptr : params.cpu_affinity.data();
+    cparams.n_cpu_affinity    = (int32_t) params.cpu_affinity.size();
     cparams.seed              = params.seed;
     cparams.logits_all        = params.logits_all;
     cparams.embeddings        = params.embedding;
@@ -4370,6 +4609,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.dsa               = params.dsa;
     cparams.fused_idx_topk    = params.fused_idx_topk;
     cparams.swa_compress      = params.swa_compress;
+    cparams.dsv4_legacy_state = params.dsv4_legacy_state;
     cparams.dsa_top_k         = params.dsa_top_k;
     cparams.k_cache_hadamard  = params.k_cache_hadamard;
     cparams.v_cache_hadamard  = params.v_cache_hadamard;
@@ -5542,7 +5782,7 @@ void argparse_expiring_logit_bias(const std::string& content, common_params_samp
             static const std::vector<std::string> names = { X_COMMON_PARAMS_SAMPLING };
 
             std::vector<float> addsubs(names.size(), 0.0f);
-            bool is_sb = false;
+            bool is_epb = false;
 
             // (... : SPARAM ...)
             const auto window = line.substr(last_qq_pos + 1);
@@ -5558,7 +5798,7 @@ void argparse_expiring_logit_bias(const std::string& content, common_params_samp
                     auto sub = string_strip(window.substr(pos, next_pos - pos));
                     if (sub[0] == '~') {
                         addsubs[j] += std::stof(sub.substr(1));
-                        is_sb = true;
+                        is_epb = true;
                         LLAMA_LOG_DEBUG("%s: line %zu: bias = %f\n", __func__, i, addsubs[j]);
                     }
                 }
@@ -5566,18 +5806,19 @@ void argparse_expiring_logit_bias(const std::string& content, common_params_samp
 
             auto& phrases = extracts;
             if (phrases.empty()) {
-                if (is_sb) {
+                if (is_epb) {
                     phrases.push_back("");
                 } else {
                     continue;   // next line
                 }
             }
 
+            int32_t max_keyword_len = 0;
             const auto n_phrase = phrases.size();
             std::vector<float> biases;
             bool is_range = false;
 
-            if (!is_sb) {
+            if (!is_epb) {
                 // (... : BIAS ...)
                 const auto cln_rpos = line.rfind(':');
                 auto sub = line.substr(cln_rpos + 1, n_char - cln_rpos - 2);
@@ -5601,20 +5842,19 @@ void argparse_expiring_logit_bias(const std::string& content, common_params_samp
                 if (biases.empty()) {
                     continue;   // next line
                 }
+            } else {
+                for (const auto& keyword: phrases) {
+                    LLAMA_LOG_DEBUG("%s: line %zu: keyword = \"%s\"\n", __func__, i, keyword.c_str());
+                    max_keyword_len = std::max(SSIZE(keyword), max_keyword_len);
+                }
+                LLAMA_LOG_DEBUG("%s: line %zu: max_keyword_len = %d\n", __func__, i, max_keyword_len);
             }
-
-            size_t max_phrase_len = 0;
-            for (const auto& phrase: phrases) {
-                LLAMA_LOG_DEBUG("%s: line %zu: phrase = \"%s\"\n", __func__, i, phrase.c_str());
-                max_phrase_len = std::max(phrase.length(), max_phrase_len);
-            }
-            LLAMA_LOG_DEBUG("%s: line %zu: max_phrase_len = %zu\n", __func__, i, max_phrase_len);
 
             common_params_sampling::elb_param::elb_entry entry = {
-                std::vector<size_t>(n_phrase, 0),
+                max_keyword_len,
+                std::vector<int32_t>(n_phrase, 0),
                 std::move(addsubs),
                 std::vector<bool>(n_phrase, false),
-                max_phrase_len,
                 std::move(phrases),
                 std::move(biases),
                 duration,

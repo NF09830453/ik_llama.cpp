@@ -159,7 +159,8 @@ struct llm_build_context {
 
     ggml_tensor * build_inp_KQ_mask_swa_win(int64_t n_kv_win, bool causal = true);
 
-    ggml_tensor * build_swa_mask_for_graph(uint32_t window, bool compacted, bool * windowed = nullptr);
+    ggml_tensor * build_swa_mask_for_graph(uint32_t window, bool compacted, bool * windowed = nullptr,
+            const llama_kv_cache * kv = nullptr);
 
     ggml_tensor * build_inp_mean();
 
@@ -249,6 +250,8 @@ struct llm_build_context {
     ggml_cgraph * build_qwen3next();
     ggml_cgraph * build_qwen4exp();
 
+    ggml_cgraph * build_lfm2();
+
     ggml_cgraph * build_qwen35moe();
 
     ggml_cgraph * build_qwen35();
@@ -301,6 +304,7 @@ struct llm_build_context {
 
     ggml_cgraph * build_deepseek2();
     ggml_cgraph * build_deepseek4();
+    ggml_cgraph * build_deepseek41();
     ggml_cgraph * build_openpangu();
 
     // openPangu attention sublayer body (shared by base layers and the NextN/MTP head):
@@ -436,6 +440,9 @@ struct llm_build_context {
 
     ggml_cgraph * build_bailingmoe2();
     ggml_cgraph * build_bailingmoe3();
+    ggml_cgraph * build_glm5next();
+
+    ggml_cgraph * build_glm5next_mtp();
 
     ggml_cgraph * build_minimaxm2();
     ggml_cgraph * build_minimaxm3();
@@ -460,6 +467,8 @@ struct llm_build_context {
     // skeleton (Stage B), or nullptr on layers without an indexer (SWA / MTP tail).
     ggml_tensor * build_step35_indexer_score(ggml_cgraph * gf, int il, ggml_tensor * inpL,
             ggml_tensor * inp_pos, ggml_tensor * KQ_mask);
+
+    ggml_cgraph * build_k2horizon();
 
     ggml_tensor * build_step35_mtp(
             const llama_layer & mtp_layer,

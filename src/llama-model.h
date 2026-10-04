@@ -81,6 +81,7 @@ enum e_model {
     MODEL_34B,
     MODEL_35B,
     MODEL_36B,
+    MODEL_36B_A4B, // K2-Horizon MoVA
     MODEL_40B,
     MODEL_65B,
     MODEL_70B,
@@ -111,6 +112,7 @@ enum e_model {
     MODEL_12B_A2_5B,
     MODEL_16B_A1B,
     MODEL_21B_A3B, // Ernie MoE small
+    MODEL_24B_A2B, // LFM2-24B-A2B
     MODEL_30B_A3B,
     MODEL_33B_A3B,
     MODEL_35B_A3B,
@@ -124,6 +126,7 @@ enum e_model {
     MODEL_230B_A10B, // Minimax M2
     MODEL_235B_A22B,
     MODEL_310B_A15B,
+    MODEL_312B_A17B,
     MODEL_300B_A47B, // Ernie MoE big
     MODEL_355B_A32B,
     MODEL_397B_A17B, // Qwen-3.5-MoE
@@ -332,6 +335,11 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_shexp = nullptr;
     struct ggml_tensor * ffn_up_shexp = nullptr;
 
+    // K2 Horizon MoVA
+    struct ggml_tensor * attn_v_gate   = nullptr;
+    struct ggml_tensor * attn_v_gate_b = nullptr;
+    struct ggml_tensor * attn_v_exps   = nullptr;
+
     llama_split_tensor split_ffn_up_shexp;
     llama_split_tensor split_ffn_gate_shexp;
     llama_split_tensor split_ffn_down_shexp;
@@ -351,6 +359,7 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_b   = nullptr; // b3
     struct ggml_tensor * ffn_act = nullptr;
     struct ggml_tensor * ffn_exp_probs_b = nullptr;
+    struct ggml_tensor * ffn_exp_probs_b_vl = nullptr;
     struct ggml_tensor * ffn_gate_tid2eid = nullptr;
 
     llama_split_tensor split_ffn_gate_b;
@@ -375,6 +384,9 @@ struct llama_layer {
     struct ggml_tensor * ssm_beta = nullptr;
     struct ggml_tensor * ssm_f_a = nullptr;
     struct ggml_tensor * ssm_g_a = nullptr;
+    // GLM-5.3-Flash (kimi-k3) low-rank KDA parameterization: f = f_b(f_a(x)), g = g_b(g_a(x))
+    struct ggml_tensor * ssm_f_b = nullptr;
+    struct ggml_tensor * ssm_g_b = nullptr;
 
     // mamba
     struct ggml_tensor * ssm_conv1d = nullptr;
@@ -441,6 +453,13 @@ struct llama_layer {
     struct ggml_tensor * attn_comp_ape     = nullptr;
     struct ggml_tensor * attn_comp_norm    = nullptr;
 
+    // n-gram keyed table, a few rows read per token. Only ever touched through get_rows,
+    // so it must never be copied, repacked or offloaded.
+    struct ggml_tensor * engram_embd = nullptr;
+    struct ggml_tensor * engram_k    = nullptr;
+    struct ggml_tensor * engram_q    = nullptr;
+    struct ggml_tensor * engram_wkv  = nullptr;
+
     // long rope factors
     struct ggml_tensor * rope_long  = nullptr;
     struct ggml_tensor * rope_short = nullptr;
@@ -502,6 +521,15 @@ struct rpc_device {
 
 struct llama_cparams;
 
+// Prism ternary activation-side Hadamard transform
+struct llama_hadamard_transform {
+    struct ggml_tensor * signs = nullptr; // [ne0]
+    int64_t block_size = 0;               // Hadamard block size, applied with ggml_hadamard
+    int64_t perm_hd  = 1;                 // GDN v-grouped reshape (head dim)
+    int64_t perm_nk  = 1;                 // GDN v-grouped reshape (n groups)
+    int64_t perm_rep = 1;                 // GDN v-grouped reshape (repeat count)
+};
+
 struct llama_model {
     e_model     type  = MODEL_UNKNOWN;
     llm_arch    arch  = LLM_ARCH_UNKNOWN;
@@ -511,6 +539,10 @@ struct llama_model {
 
     llama_hparams hparams = {};
     llama_vocab   vocab;
+
+    // Prism ternary Hadamard rotations, keyed by GGUF weight name (empty for other models)
+    std::unordered_map<std::string, llama_hadamard_transform> hadamard_map;
+    const llama_hadamard_transform * hadamard_rotation(const struct ggml_tensor * t) const;
 
     struct ggml_tensor * tok_embd;
     struct ggml_tensor * type_embd;
@@ -547,6 +579,14 @@ struct llama_model {
     struct ggml_tensor * hc_head_fn = nullptr;
     struct ggml_tensor * hc_head_scale = nullptr;
 
+    // engram hash constants, indexed [engram layer][ngram] and [engram layer][(ngram-1)*n_head
+    // + head]. They index straight into engram_embd, so the loader validates their counts.
+    std::vector<uint64_t> engram_multipliers;
+    std::vector<uint64_t> engram_primes;
+    std::vector<uint64_t> engram_offsets;
+    std::vector<uint32_t> engram_token_map;
+    uint32_t              engram_pad_id = 0;
+
     // qwen4exp: final low-rank hyper-connection mix, plus the n-gram embedding table
     struct ggml_tensor * hc_head_norm = nullptr;
     struct ggml_tensor * hc_head_down = nullptr;
@@ -564,6 +604,9 @@ struct llama_model {
     std::unique_ptr<ggml_tensor> dflash_tok_embd_ptr;
     std::unique_ptr<ggml_tensor> dflash_output_ptr;
     std::unique_ptr<ggml_tensor> dflash_output_mtp_ptr;
+
+    std::unique_ptr<ggml_tensor> qwen4exp_tok_embd_ptr;
+    std::unique_ptr<ggml_tensor> qwen4exp_output_ptr;
 
     llama_split_tensor split_output;
     llama_split_tensor split_output_norm;
@@ -624,7 +667,7 @@ struct llama_model {
 
     bool tensor_overrides;
 
-    // Set by llm_apply_khad_pretransform once H is folded into wv_b/wk_b_pp.
+    // Set by llm_apply_khad_pretransform once H is folded into wv_b/kv_b_pp.
     bool khad_pretransformed = false;
 
     ~llama_model();
@@ -632,7 +675,7 @@ struct llama_model {
     size_t max_nodes(int n_tokens) const {
         auto n_tensors = tensors_by_name.size();
         if (split_mode == LLAMA_SPLIT_MODE_GRAPH && !devices.empty()) n_tensors *= devices.size();
-        if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN4EXP) {
+        if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_GLM5NEXT) {
             return std::max<size_t>(n_tokens * 40, 32u * n_tensors);
         }
         //return std::max<size_t>(1024, 8*n_tensors);
@@ -644,11 +687,11 @@ struct llama_model {
     }
 
     bool is_mla_model() const {
-        return arch == LLM_ARCH_DEEPSEEK2 || arch == LLM_ARCH_GLM_DSA || arch == LLM_ARCH_MISTRAL4 || arch == LLM_ARCH_BAILINGMOE3;
+        return arch == LLM_ARCH_DEEPSEEK2 || arch == LLM_ARCH_GLM_DSA || arch == LLM_ARCH_MISTRAL4 || arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_GLM5NEXT;
     }
 
     float swiglu_limit(uint32_t il, bool shared) const {
-        if (arch != LLM_ARCH_STEP35 && arch != LLM_ARCH_BAILINGMOE3 && arch != LLM_ARCH_DEEPSEEK4) {
+        if (arch != LLM_ARCH_STEP35 && arch != LLM_ARCH_BAILINGMOE3 && !llm_arch_is_dsv4(arch) && arch != LLM_ARCH_GLM5NEXT && !hparams.dflash_dsv4) {
             return 0.0f;
         }
         return shared ? hparams.swiglu_limits_shared[il] : hparams.swiglu_limits[il];
@@ -676,7 +719,7 @@ struct llama_model {
     }
 
     bool supports_swa_compress() const {
-        return arch == LLM_ARCH_OPENPANGU || arch == LLM_ARCH_DEEPSEEK4
+        return arch == LLM_ARCH_OPENPANGU || llm_arch_is_dsv4(arch)
             || arch == LLM_ARCH_LAGUNA    || arch == LLM_ARCH_GEMMA4
             || arch == LLM_ARCH_MIMO2     || arch == LLM_ARCH_STEP35
             || supports_dflash_swa_compress() ;
