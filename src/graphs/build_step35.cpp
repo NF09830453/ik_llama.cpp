@@ -546,9 +546,30 @@ ggml_cgraph * llm_build_context::build_step35() {
             // = 4096 kept slots). Kept-count must be a multiple of B so the rank cutoff snaps to
             // whole blocks (intra-block broadcast scores tie contiguously in the argsort).
             const int64_t Bsel = hparams.indexer_csa_block > 0 ? hparams.indexer_csa_block : 8;
-            const int64_t kept_slots = ik_sel_block_grain()
+            // Fixed kept-capacity starves selection once n_kv exceeds it: every key ranked past
+            // kept_slots is masked to -BIG on the indexer's ranking, so recall decays gradually
+            // as (n_kv - kept) grows (long verbatim spans die first, short tokens survive).
+            // Scale kept capacity with n_kv past the configured floor: kept = max(topk*Bsel,
+            // ceil(n_kv*pct/100)) rounded UP to a whole block, capped at n_kv (clamp in the mask
+            // builder makes kept==n_kv exact-dense). Floor keeps short-context sparsity intact.
+            // IK_SEL_KEEP_PCT opts INTO the scaling (default 0 = fixed floor kept = topk*Bsel,
+            // the prod-parity-tested keep0 regime; 50 => keep half; 100 => always dense).
+            // λ=0.5 sole-knob discriminator (keep0 quick + full prod-parity @ pct 0, all 18/18
+            // fabric 0) => scaling is defensive only, NOT load-bearing; fixed capacity is also the
+            // gather-forward regime (kept proportional to n_kv defeats flat-decode gather economics).
+            static const int keep_pct = getenv("IK_SEL_KEEP_PCT") ? atoi(getenv("IK_SEL_KEEP_PCT")) : 0;
+            const int64_t n_kv_sel = KQ_mask->ne[0];
+            int64_t kept_slots = ik_sel_block_grain()
                 ? (int64_t) hparams.indexer_top_k * Bsel
                 : (int64_t) hparams.indexer_top_k;
+            {
+                const int64_t scaled = (n_kv_sel * keep_pct + 99) / 100;
+                if (scaled > kept_slots) kept_slots = scaled;
+                if (ik_sel_block_grain()) {
+                    kept_slots = ((kept_slots + Bsel - 1) / Bsel) * Bsel;  // whole-block snap
+                }
+                if (kept_slots > n_kv_sel) kept_slots = n_kv_sel;
+            }
             if (!sparse_base_leaf) {
                 sparse_base_leaf = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, KQ_mask->ne[0], idx_score->ne[1]);
             }

@@ -649,11 +649,37 @@ ggml_tensor * llm_build_context::build_deepseek2_dsa_sparse_mask(
     // effect and cannot produce NaN). So -BIG masks the key on BOTH paths.
     const float BIG = 1e30f;
 
-    // rank-based penalty vector: pen[rank] = 0 for rank < n_top_k, else -BIG.  {n_kv}
-    // sel = step(n_top_k - 0.5 - rank) = 1 for rank <= n_top_k-1, else 0
+    // rank-based penalty vector: pen[rank] = 0 for rank < n_top_k, -IK_SEL_SOFT for EVERY rank
+    // past the cutoff (constant soft gate -- deliberately NOT a rank-distance ramp). {n_kv} F32
+    // IK_SEL_SOFT = penalty magnitude in ATTENTION-LOGIT units (default 0 = legacy cliff, opt-in
+    // soft gate via IK_SEL_SOFT>0): this mask is
+    // ADDITIVE on attention logits (~O(1-10)), NOT on indexer scores.
+    // Constant (vs ramp) semantics are load-bearing for path-recall probes:
+    //   * non-kept keys keep their TRUE attention-logit ordering -- the penalty is a uniform shift,
+    //     so semantically-linked neighbours outside top-k compete on their real qk scores and can
+    //     out-attend a weak kept key iff their logit margin exceeds IK_SEL_SOFT. A rank-distance
+    //     ramp double-counts the indexer ranking instead: an under-ranked critical key (IQ3 proxy
+    //     key noise) is penalized MORE the further the ranking error sank it -- rank error compounds
+    //     multiplicatively across ~10-25-key path spans.
+    //   * lambda is ctx-invariant (a ramp over tail = n_kv - kept flattens as n_kv grows, making
+    //     lambda incomparable across probe depths).
+    // Caveats: constant lambda is STRICTER at the margin than a ramp (near-cutoff keys get the full
+    // penalty immediately), so lambda must sit in the attention-logit margin band (~0.5-3);
+    // lambda >> logit span ~= cliff (e^-lambda ~ 0). Default 0 keeps shipped deepseek behavior
+    // bitwise on BOTH -fa paths (-fa 1 uses fused ggml_indexer_mask cliff which never read
+    // IK_SEL_SOFT; -fa 0 takes the identical legacy cliff branch below).
+    // sel => pen == 0 EXACTLY for every r <= n_top_k
+    // (+lambda - lambda cancels bitwise in F32 => G1 dense-equivalence at ctx <= topk unchanged).
     ggml_tensor * rank = ggml_arange(ctx0, 0.0f, (float) n_kv_local, 1.0f);          // {n_kv} F32
-    ggml_tensor * sel  = ggml_step(ctx0, ggml_scale_bias(ctx0, rank, -1.0f, (float) n_top_k - 0.5f));
-    ggml_tensor * pen  = ggml_scale_bias(ctx0, sel, BIG, -BIG);                       // 0 or -BIG
+    static const float soft_pen = getenv("IK_SEL_SOFT") ? (float) atof(getenv("IK_SEL_SOFT")) : 0.0f;
+    // sel = step(n_top_k - 0.5 - rank) = 1 for rank <= n_top_k-1, else 0
+    ggml_tensor * sel = ggml_step(ctx0, ggml_scale_bias(ctx0, rank, -1.0f, (float) n_top_k - 0.5f));
+    ggml_tensor * pen;
+    if (soft_pen <= 0.0f) {
+        pen = ggml_scale_bias(ctx0, sel, BIG, -BIG);                                 // 0 or -BIG (legacy cliff)
+    } else {
+        pen = ggml_scale_bias(ctx0, sel, soft_pen, -soft_pen);                       // 0 or -soft_pen
+    }
 
     // shape penalty to {1, n_kv, n_tok} (broadcast the per-rank value across all query columns)
     pen = ggml_reshape_3d(ctx0, pen, 1, n_kv_local, 1);
