@@ -2007,6 +2007,44 @@ static void llama_kv_cache_compact_swa(struct llama_context & lctx, uint32_t n_t
         }
     }
 
+    // DSA indexer-key cache (kr_l): one row per cell, keys cannot be recomputed
+    // (GLM packs [key; gate] per row and the gate needs the hidden state), so the
+    // surviving window rows must MOVE with K/V here. Skipping this left kr_l
+    // row-shifted by `drop` against K/V after every SWA fire while pos_base_swa
+    // advanced — indexer scores pair queries with stale keys (= prod binding
+    // corruption from the first compress fire on). Mirrors build_defrag's kr_l
+    // move + qsa_pooled_stale marking.
+    for (size_t il = 0; il < cache.kr_l.size(); ++il) {
+        ggml_tensor * kr = cache.kr_l[il];
+        if (!cache.is_compacted((int) il) || kr == nullptr) {
+            continue;
+        }
+        const size_t kr_rows_il = cache.rows(il);
+        GGML_ASSERT(kr_rows_il > 0 && kr->ne[1] % kr_rows_il == 0);
+        if (kr->extra) {
+            // split-across-devices indexer cache: compact each chunk like split K/V
+            auto kr_extra = (ggml_split_tensor_t *) kr->extra;
+            for (int is = 0; is < kr_extra->n_device; ++is) {
+                auto kr_split = kr_extra->splits[is];
+                if (!kr_split) {
+                    continue;
+                }
+                const size_t rows_per_pos_s = (size_t) kr_split->ne[1] / kr_rows_il;
+                const size_t stride_s = kr_split->nb[1] * rows_per_pos_s;
+                copy_bytes(kr_split, src_row * stride_s, dst_row * stride_s, n_keep * stride_s);
+            }
+            continue;
+        }
+        // indexer keys are per-cell: rows_per_pos == 1
+        const size_t rows_per_pos = (size_t) kr->ne[1] / kr_rows_il;
+        const size_t stride = kr->nb[1] * rows_per_pos;
+        copy_bytes(kr, src_row * stride, dst_row * stride, n_keep * stride);
+    }
+
+    // kr_l rows just moved => pooled block keys (kp_l) derived from them are stale;
+    // rebuild every block on the next graph, as defrag and restore already do.
+    lctx.qsa_pooled_stale = lctx.qsa_pooled_stale || !cache.kp_l.empty();
+
     cache.pos_base_swa += (llama_pos) drop;
     cache.head_swa      = cache.sink_rows + n_keep;
 }
@@ -11169,7 +11207,11 @@ struct llama_data_write {
 
         if (dsa_indexer_state != 0) {
             for (uint32_t il = 0; il < n_layer; ++il) {
-                const bool has_kr_cache = need_kv && il < kv_self.kr_l.size() && kv_self.kr_l[il] != nullptr;
+                // kr_l rides the compacted-K carve-out above: a compacted layer holds the
+                // only copy of its indexer window, so PARTIAL_ONLY has to carry it (openPangu
+                // layout excluded, see the has_k_cache note). need_kv writes full ranges.
+                const bool has_kr_cache = il < kv_self.kr_l.size() && kv_self.kr_l[il] != nullptr &&
+                    (need_kv || (!openpangu_partial && kv_self.is_compacted((int) il)));
                 if (!has_kr_cache) continue;
 
                 const int32_t kr_type_i = has_kr_cache ? (int32_t) kv_self.kr_l[il]->type : -1;
@@ -11177,6 +11219,15 @@ struct llama_data_write {
 
                 const uint64_t kr_size_row = has_kr_cache ? ggml_row_size(kv_self.kr_l[il]->type, kv_self.kr_l[il]->ne[0]) : 0;
                 write(&kr_size_row, sizeof(kr_size_row));
+
+                // compacted layer: the indexer window lives at [sink_rows, sink_rows + live_swa())
+                if (kv_self.is_compacted((int) il)) {
+                    const size_t live = kv_self.live_swa();
+                    if (live) {
+                        write_tensor_data(kv_self.kr_l[il], kv_self.sink_rows * kr_size_row, live * kr_size_row, il);
+                    }
+                    continue;
+                }
 
                 for (const auto & range : cell_ranges) {
                     const size_t range_size = range.second - range.first;
@@ -12004,7 +12055,10 @@ struct llama_data_read {
 
         if (dsa_indexer_state_ref != 0) {
             for (uint32_t il = 0; il < n_layer; ++il) {
-                const bool has_kr_cache = need_kv && il < kv_self.kr_l.size() && kv_self.kr_l[il] != nullptr;
+                // symmetric carve-out with write_kv_cache_data: compacted layers carry
+                // their indexer window under PARTIAL_ONLY (openPangu layout excluded)
+                const bool has_kr_cache = il < kv_self.kr_l.size() && kv_self.kr_l[il] != nullptr &&
+                    (need_kv || (!openpangu_partial && kv_self.is_compacted((int) il)));
                 if (!has_kr_cache) continue;
 
                 int32_t kr_type_i_ref;
@@ -12023,11 +12077,15 @@ struct llama_data_read {
                     return false;
                 }
 
-                if (cell_count) {
+                const bool     kr_compact = kv_self.is_compacted((int) il);
+                const uint32_t kr_rows    = kr_compact ? kv_self.live_swa() : cell_count;
+                const uint32_t kr_dst     = kr_compact ? kv_self.sink_rows  : kv_self.head;
+
+                if (kr_rows) {
                     if (kv_self.kr_l[il]->extra) {
-                        read_kv_cache_data_split(ctx, kv_self.kr_l[il], read(cell_count * kr_size_row), kv_self.head, kr_size_row, cell_count, il);
+                        read_kv_cache_data_split(ctx, kv_self.kr_l[il], read(kr_rows * kr_size_row), kr_dst, kr_size_row, kr_rows, il);
                     } else {
-                        ggml_backend_tensor_set(kv_self.kr_l[il], read(cell_count * kr_size_row), kv_self.head * kr_size_row, cell_count * kr_size_row);
+                        ggml_backend_tensor_set(kv_self.kr_l[il], read(kr_rows * kr_size_row), kr_dst * kr_size_row, kr_rows * kr_size_row);
                     }
                 }
             }
