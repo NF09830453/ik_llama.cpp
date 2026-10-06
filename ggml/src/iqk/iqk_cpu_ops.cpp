@@ -1078,7 +1078,13 @@ void iqk_mask_topk(struct ggml_tensor * dst, int ith, int nth) {
     int first = ith*npt;
     int last  = std::min(first + npt, nrows);
 
-    auto hinf  = GGML_FP32_TO_FP16(-INFINITY);
+    // pen <= 0 -> -INF cliff (legacy); pen > 0 -> soft gate -pen (dense mask still forces
+    // -INF on future/padding cells).
+    float pen;
+    memcpy(&pen, &dst->op_params[0], sizeof(float));
+    float fill = pen > 0.0f ? -pen : -INFINITY;
+
+    auto hinf  = GGML_FP32_TO_FP16(fill);
     auto hzero = GGML_FP32_TO_FP16(0.0f);
 
     int n = dst->ne[0];
@@ -1103,7 +1109,7 @@ void iqk_mask_topk(struct ggml_tensor * dst, int ith, int nth) {
             auto x = (const float *)((const char *)mask->data + mask->nb[1]*i1 + mask->nb[2]*i2 + mask->nb[3]*i3);
             auto y = (float *)((char *)dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
             if (i1 < topk->ne[1]) {
-                for (int j = 0; j < n; ++j) y[j] = -INFINITY;
+                for (int j = 0; j < n; ++j) y[j] = fill;
                 for (int j = 0; j < nidx; ++j) y[idx[j]] = 0.0f;
                 for (int j = 0; j < n; ++j) y[j] += x[j];
             } else {

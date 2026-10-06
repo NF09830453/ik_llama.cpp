@@ -670,6 +670,7 @@ struct llama_context {
     struct ggml_tensor * inp_mtp_carry = nullptr; // F32 [n_embd, nextn-1] per-head hidden at the last committed position
     struct ggml_tensor * inp_dsa_sink = nullptr; // F32 [n_kv, n_tokens] per-sequence attention-sink boost for DSA indexer top-k
     struct ggml_tensor * inp_kv_pos = nullptr;   // I32 [n_kv] cached-cell positions (STEP35 indexer read-back RoPE; llama_set_inputs fill from kv_self.cells)
+    struct ggml_tensor * inp_step35_cell_blk = nullptr; // I32 [n_kv] cell -> CSA block map (slot-aligned i/B; fused indexer topk expand; llama_set_inputs fill)
     struct ggml_tensor * inp_kpool_cells     = nullptr; // I32 [kpool*n_pool] cell index of each pool member (pool b, member j at [b*kpool+j])
     struct ggml_tensor * inp_kpool_bias      = nullptr; // F32 [n_pool, n_tokens] 0 if pool complete & visible to query, else -inf
     struct ggml_tensor * inp_kpool_tail      = nullptr; // I32 [kpool-1, n_tokens] trailing incomplete pool cells (null when kpool==1)

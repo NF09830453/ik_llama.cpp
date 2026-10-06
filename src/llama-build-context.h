@@ -465,8 +465,14 @@ struct llm_build_context {
     // applied at read-back (q at inp_pos, cached k at inp_kv_pos). Semantic knobs land in Slice 3.
     // Returns the causal-seeded indexer score {n_kv, n_tokens} (F32) for the IK_SPARSE selection
     // skeleton (Stage B), or nullptr on layers without an indexer (SWA / MTP tail).
+    // fused_mask_out (optional): when the fused path is active (IK_SPARSE=1 + cparams.fused_idx_topk
+    // + no tap capture + block-grain + backend support), the function instead builds the pooled
+    // block keys -> ggml_indexer_topk (in-kernel relu(q.k)*w sum + causal seed + descending topk)
+    // -> ggml_indexer_mask (topk cells unmasked, rest -IK_SEL_SOFT, += dense mask) chain and
+    // stores the final attention mask in *fused_mask_out, returning nullptr (no decomposed score
+    // tensor is materialized). kept >= n_kv short-circuits to exact-dense (both outputs null).
     ggml_tensor * build_step35_indexer_score(ggml_cgraph * gf, int il, ggml_tensor * inpL,
-            ggml_tensor * inp_pos, ggml_tensor * KQ_mask);
+            ggml_tensor * inp_pos, ggml_tensor * KQ_mask, ggml_tensor ** fused_mask_out = nullptr);
 
     ggml_cgraph * build_k2horizon();
 

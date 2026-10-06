@@ -122,6 +122,32 @@ static int ik_ssmax_n_mode() {
     GGML_ASSERT(mode >= 0 && mode <= 1 && "IK_SSMAX_N: 0=ln(n_ctx), 1=ln(padded n_kv); 2 (used-span) deferred");
     return mode;
 }
+// IK_SEL_SOFT soft-gate penalty (attention-logit units; default 0 = cliff). Read here for the
+// FUSED selection path's ggml_indexer_mask; MUST stay in sync with the decomposed path's read
+// in build_deepseek2_dsa_sparse_mask (same env, read once per process -> same value).
+static float ik_sel_soft_pen() {
+    static const float pen = getenv("IK_SEL_SOFT") ? (float) atof(getenv("IK_SEL_SOFT")) : 0.0f;
+    return pen;
+}
+// Kept-slot capacity for the selection cutoff, SHARED by the fused (ggml_indexer_topk width)
+// and decomposed (rank-penalty scatter) paths so the two cannot drift. Block-grain counts
+// BLOCKS (topk x Bsel slots); IK_SEL_KEEP_PCT opts into n_kv-proportional scaling (default 0 =
+// fixed floor, the prod-parity-tested keep0 regime); whole-block snap; clamp at n_kv (== exact
+// dense -- the decomposed clamp makes pen(rank)==0 for every key, the fused path short-circuits).
+static int64_t ik_kept_slots(const llama_hparams & hparams, int64_t n_kv_sel) {
+    const int64_t Bsel = hparams.indexer_csa_block > 0 ? hparams.indexer_csa_block : 8;
+    int64_t kept = ik_sel_block_grain()
+        ? (int64_t) hparams.indexer_top_k * Bsel
+        : (int64_t) hparams.indexer_top_k;
+    static const int keep_pct = getenv("IK_SEL_KEEP_PCT") ? atoi(getenv("IK_SEL_KEEP_PCT")) : 0;
+    const int64_t scaled = (n_kv_sel * keep_pct + 99) / 100;
+    if (scaled > kept) kept = scaled;
+    if (ik_sel_block_grain()) {
+        kept = ((kept + Bsel - 1) / Bsel) * Bsel;  // whole-block snap
+    }
+    if (kept > n_kv_sel) kept = n_kv_sel;
+    return kept;
+}
 
 void llm_build_context::build_step35_indexer_kv_write(ggml_cgraph * gf, int il, ggml_tensor * inpL) {
     const int64_t head_size = hparams.indexer_head_size;
@@ -186,7 +212,8 @@ void llm_build_context::build_step35_indexer_kv_write(ggml_cgraph * gf, int il, 
 // Perf note (Slice 3): the cached span is cast to F32 for the pe RoPE; fine at gate contexts,
 // revisit (quantized nope matmul + cast only the pe slice) before 1M-ctx decode work.
 ggml_tensor * llm_build_context::build_step35_indexer_score(ggml_cgraph * gf, int il,
-        ggml_tensor * inpL, ggml_tensor * inp_pos, ggml_tensor * KQ_mask) {
+        ggml_tensor * inpL, ggml_tensor * inp_pos, ggml_tensor * KQ_mask,
+        ggml_tensor ** fused_mask_out) {
     const int64_t head_size = hparams.indexer_head_size; // proxy_dim (HF sparse_config: 256)
     const int64_t n_ihead   = hparams.indexer_n_head;    // proxy q heads (HF num_heads: 16)
 
@@ -196,6 +223,24 @@ ggml_tensor * llm_build_context::build_step35_indexer_score(ggml_cgraph * gf, in
     }
     GGML_ASSERT(head_size > 0 && n_ihead > 0);
     GGML_ASSERT(n_kv > 0 && n_kv <= (int64_t) kv_self.size);
+
+    // ---- fused selection path decision (built BEFORE the heavy chains so the exact-dense
+    // short-circuit can skip them entirely) ----
+    // Active iff selection is on (IK_SPARSE=1), the fused ops are enabled (cparams.fused_idx_topk,
+    // CLI -fidx/-no-fidx, default on), NOT under tap capture (cb_eval -> decomposed chain keeps
+    // the T9 oracle tapes byte-identical), and selection is BLOCK-grain (the default; the pooled
+    // block keys feed the fused op's cell_blk expand). Token-grain (IK_SEL_GRAIN=0) stays
+    // decomposed as the regression anchor.
+    const bool fused_try = fused_mask_out != nullptr && ik_sparse_enabled() &&
+            lctx.cparams.fused_idx_topk && !lctx.cparams.cb_eval &&
+            (ik_csa_mode() != 0 || ik_sel_block_grain());
+    const int64_t kept = fused_try ? ik_kept_slots(hparams, n_kv) : 0;
+    if (fused_try && kept >= n_kv) {
+        // kept == n_kv: selection keeps every key == EXACT DENSE (the decomposed path reaches
+        // the same mask through the pen(rank)==0 clamp). Skip the whole indexer scoring chain;
+        // the caller keeps the dense KQ_mask. G1 dense-equivalence holds by construction.
+        return nullptr;
+    }
 
     const auto & layer = model.layers[il];
     GGML_ASSERT(layer.indexer_q && layer.indexer_z && layer.indexer_w && layer.indexer_q_norm);
@@ -409,6 +454,50 @@ ggml_tensor * llm_build_context::build_step35_indexer_score(ggml_cgraph * gf, in
         ggml_tensor * block_k = ggml_div(ctx0, num, den); // broadcast {head,n_blocks}/{1,n_blocks}
         cb(block_k, "step35_indexer_block_k", il);
 
+        // ---- FUSED selection path: block keys + cell_blk expand + ggml_indexer_topk +
+        // ggml_indexer_mask (qwen4exp.cpp:419 wiring precedent). The topk op scores and sorts
+        // IN-KERNEL (relu(q·k)·w summed over proxy heads + causal mask seed + descending sort;
+        // the {n_kv, n_tokens} score matrix NEVER materializes in the compute buffer) and the
+        // mask op writes the final attention mask in one pass (topk cells 0, every other cell
+        // -IK_SEL_SOFT, dense mask added on top -> future/padding stay -INF). Together they
+        // replace score_chain + slot broadcast + argsort + rank-penalty scatter + fa_mask
+        // adapter -- the ~25 F32 {kv,ub} tensor-equivalents that dominate the sparse-mode
+        // compute buffer collapse to the pooling chain (O(kv/8)) + one mask-sized output.
+        // Semantics == decomposed: same pooled block keys, same w-weighted scores (F32 k takes
+        // the F32 GEMM branch -- no FP16 rounding of the scores), same kept capacity
+        // (ik_kept_slots), same constant soft gate (ik_sel_soft_pen); the CUB radix sort is
+        // STABLE, so intra-block score ties stay contiguous in rank order and the kept cutoff
+        // (a multiple of B) still snaps to whole blocks.
+        if (fused_try) {
+            // causal seed: RAW KQ_mask view (F16 on -fa 1 / F32 on -fa 0 -- the op templates
+            // both; no F32 cast needed here, unlike the decomposed add below).
+            ggml_tensor * mseed = ggml_view_2d(ctx0, KQ_mask, n_kv, n_tokens, KQ_mask->nb[1], 0);
+            if (!lctx.inp_step35_cell_blk) {
+                // cell -> block map, slot-aligned i/B (same grouping as the pooling reshape
+                // above); host-filled in llama_set_inputs. One shared input per graph -- every
+                // full-attn layer consumes the same map (inp_kv_pos lazy-create pattern).
+                lctx.inp_step35_cell_blk = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_kv);
+                cb(lctx.inp_step35_cell_blk, "step35_cell_blk", -1);
+                ggml_set_input(lctx.inp_step35_cell_blk);
+                ggml_build_forward_expand(gf, lctx.inp_step35_cell_blk);
+            }
+            ggml_tensor * topk = ggml_indexer_topk(ctx0, block_k, q_cur, w_cur, mseed,
+                    lctx.inp_step35_cell_blk, GGML_UNARY_OP_RELU, (int) kept);
+            if (supports_op(topk)) {
+                cb(topk, "step35_indexer_topk", il);
+                ggml_build_forward_expand(gf, topk);
+                // dup of KQ_mask: F16 {n_kv, padded n_tok} on -fa 1 (FA-ready, no adapter),
+                // F32 {n_kv, n_tok} additive on -fa 0. pen = IK_SEL_SOFT (0 = -INF cliff).
+                ggml_tensor * fm = ggml_indexer_mask(ctx0, KQ_mask, topk, ik_sel_soft_pen());
+                cb(fm, "step35_fused_mask", il);
+                ggml_build_forward_expand(gf, fm);
+                *fused_mask_out = fm;
+                return nullptr; // no decomposed score tensor -- caller consumes *fused_mask_out
+            }
+            // backend cannot run the fused op: fall through to the decomposed chain below
+            // (deepseek2.cpp:506 supports_op fallback precedent)
+        }
+
         ggml_tensor * block_score = score_chain(block_k, n_blocks); // {n_blocks, n_tokens}
         cb(block_score, "step35_indexer_block_score", il);
 
@@ -525,51 +614,47 @@ ggml_cgraph * llm_build_context::build_step35() {
         layer.rope_freqs = nullptr;
         // Slice 1/2 plumbing: proxy-key cache write (real proxy key: k_norm(k_proj), RAW) +
         // read-back scoring telemetry (semantic selection core deferred to Slice 3 knobs).
+        // fused_mask: set when the fused selection path ran (in-kernel score/sort + mask write;
+        // build_step35_indexer_score) -- see the Stage B comment below.
         build_step35_indexer_kv_write(gf, il, inpL);
-        ggml_tensor * idx_score = build_step35_indexer_score(gf, il, inpL, inp_pos, KQ_mask);
+        ggml_tensor * fused_mask = nullptr;
+        ggml_tensor * idx_score = build_step35_indexer_score(gf, il, inpL, inp_pos, KQ_mask, &fused_mask);
 
         // ---- Stage B IK_SPARSE selection skeleton (mask-based sparse attention FIRST) ----
-        // Reuses the arch-neutral DSA members verbatim: full descending argsort over the n_kv axis
-        // -> rank-penalty scatter mask (build_deepseek2_dsa_sparse_mask; the --dsa-top-k/-dsatk
-        // kept-key-count characterization knob applies here too) -> FA adapter (…_dsa_fa_mask)
-        // when -fa 1 needs the F16 padded contiguous mask shape. ALWAYS built under IK_SPARSE=1,
-        // deliberately NO n_kv <= topk short-circuit: at ctx <= topk the clamp makes pen(rank)==0
-        // for every key, so the mask == the causal mask BITWISE and logits == IK_SPARSE=0 dense
-        // EXACTLY -- the G1 dense-equivalence oracle therefore exercises the whole argsort/scatter
-        // path instead of bypassing it. Cost at ctx <= topk is trivial; gather/fused-indexer
-        // bandwidth wins stay on the 1M-ctx decode TODO list (AGENTS.md strategy).
+        // Two equivalent implementations, same semantics (same pooled keys, same kept capacity
+        // ik_kept_slots, same constant soft gate IK_SEL_SOFT):
+        //   FUSED (default under IK_SPARSE=1 + -fidx + no tap capture): ggml_indexer_topk +
+        //     ggml_indexer_mask inside build_step35_indexer_score -- no {n_kv, n_tokens} score
+        //     matrix, no argsort/scatter chain, no fa_mask adapter; the compute buffer collapses
+        //     from ~29 to ~4 F32 {kv,ub} equivalents (pooling + vis + mask output).
+        //   DECOMPOSED (cb_eval tap capture, -no-fidx, token-grain anchor, or backend without
+        //     the fused ops): full descending argsort over the n_kv axis -> rank-penalty scatter
+        //     mask (build_deepseek2_dsa_sparse_mask; the --dsa-top-k/-dsatk kept-key-count
+        //     characterization knob applies here too) -> FA adapter (..._dsa_fa_mask) when -fa 1
+        //     needs the F16 padded contiguous mask shape. ALWAYS built under IK_SPARSE=1,
+        //     deliberately NO n_kv <= topk short-circuit: at ctx <= topk the clamp makes
+        //     pen(rank)==0 for every key, so the mask == the causal mask BITWISE and logits ==
+        //     IK_SPARSE=0 dense EXACTLY -- the G1 dense-equivalence oracle therefore exercises
+        //     the whole argsort/scatter path instead of bypassing it (the fused path reaches the
+        //     same exact-dense result via its kept==n_kv short-circuit).
+        // KV-row gather (computing attention over kept rows only) stays on the 1M-ctx decode
+        // TODO list -- both paths are mask-only today.
         ggml_tensor * attn_mask = is_swa ? KQ_mask_swa : KQ_mask;
-        if (!is_swa && ik_sparse_enabled() && idx_score) {
+        if (!is_swa && ik_sparse_enabled()) {
+            if (fused_mask) {
+                // dup of the dense KQ_mask shape/type (F16 padded on -fa 1, F32 on -fa 0):
+                // consumed directly on BOTH attention paths, no adapter.
+                attn_mask = fused_mask;
+            } else if (idx_score) {
             ggml_tensor * sorted = ggml_argsort(ctx0, idx_score, GGML_SORT_ORDER_DESC);
             cb(sorted, "step35_indexer_sorted", il);
             // Block-grain selection: topk counts BLOCKS (sparse_config topk=512 x region_block_size=8
             // = 4096 kept slots). Kept-count must be a multiple of B so the rank cutoff snaps to
             // whole blocks (intra-block broadcast scores tie contiguously in the argsort).
-            const int64_t Bsel = hparams.indexer_csa_block > 0 ? hparams.indexer_csa_block : 8;
-            // Fixed kept-capacity starves selection once n_kv exceeds it: every key ranked past
-            // kept_slots is masked to -BIG on the indexer's ranking, so recall decays gradually
-            // as (n_kv - kept) grows (long verbatim spans die first, short tokens survive).
-            // Scale kept capacity with n_kv past the configured floor: kept = max(topk*Bsel,
-            // ceil(n_kv*pct/100)) rounded UP to a whole block, capped at n_kv (clamp in the mask
-            // builder makes kept==n_kv exact-dense). Floor keeps short-context sparsity intact.
-            // IK_SEL_KEEP_PCT opts INTO the scaling (default 0 = fixed floor kept = topk*Bsel,
-            // the prod-parity-tested keep0 regime; 50 => keep half; 100 => always dense).
-            // λ=0.5 sole-knob discriminator (keep0 quick + full prod-parity @ pct 0, all 18/18
-            // fabric 0) => scaling is defensive only, NOT load-bearing; fixed capacity is also the
-            // gather-forward regime (kept proportional to n_kv defeats flat-decode gather economics).
-            static const int keep_pct = getenv("IK_SEL_KEEP_PCT") ? atoi(getenv("IK_SEL_KEEP_PCT")) : 0;
-            const int64_t n_kv_sel = KQ_mask->ne[0];
-            int64_t kept_slots = ik_sel_block_grain()
-                ? (int64_t) hparams.indexer_top_k * Bsel
-                : (int64_t) hparams.indexer_top_k;
-            {
-                const int64_t scaled = (n_kv_sel * keep_pct + 99) / 100;
-                if (scaled > kept_slots) kept_slots = scaled;
-                if (ik_sel_block_grain()) {
-                    kept_slots = ((kept_slots + Bsel - 1) / Bsel) * Bsel;  // whole-block snap
-                }
-                if (kept_slots > n_kv_sel) kept_slots = n_kv_sel;
-            }
+            // kept capacity: ik_kept_slots (SHARED with the fused path -- see its comment for the
+            // IK_SEL_KEEP_PCT scaling rationale: default 0 = fixed floor, prod-parity-tested keep0
+            // regime; scaling is defensive only and defeats flat-decode gather economics).
+            const int64_t kept_slots = ik_kept_slots(hparams, KQ_mask->ne[0]);
             if (!sparse_base_leaf) {
                 sparse_base_leaf = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, KQ_mask->ne[0], idx_score->ne[1]);
             }
@@ -580,6 +665,9 @@ ggml_cgraph * llm_build_context::build_step35() {
                 cb(sparse, "step35_sparse_mask_fa", il);
             }
             attn_mask = sparse;
+            }
+            // both null (fused kept>=n_kv short-circuit): attn_mask stays the dense KQ_mask
+            // == exact dense, G1 semantics
         }
         // IK_SSMAX per-q-head logit scale beta_h = s_h * ln(n): ssmax_s {n_head} reshaped to
         // {1, n_head, 1} broadcasts along Qcur's head axis (Qcur is {hd, n_head, n_tokens} at

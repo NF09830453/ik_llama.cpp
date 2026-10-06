@@ -2464,10 +2464,15 @@ extern "C" {
             struct ggml_tensor  * b,
             float                 c);
 
+    // pen <= 0: classic cliff -- non-topk cells get -INF before the dense mask is added.
+    // pen  > 0: soft gate -- non-topk cells get -pen instead (the dense mask still forces
+    //            -INF on future/padding cells; visible non-selected keys keep their true
+    //            attention-logit ordering, just shifted by pen).
     GGML_API struct ggml_tensor * ggml_indexer_mask(
             struct ggml_context * ctx,
             struct ggml_tensor  * mask,
-            struct ggml_tensor  * topk);
+            struct ggml_tensor  * topk,
+            float                 pen);
 
 
     // sort rows

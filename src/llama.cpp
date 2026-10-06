@@ -5675,6 +5675,22 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         }
     }
 
+    if (lctx.inp_step35_cell_blk) {
+        // STEP35 fused indexer topk: cell -> CSA block map for the pooled-block key expand.
+        // Blocks are SLOT-ALIGNED (cell i -> block i/B) -- the same grouping as the builder's
+        // CSA pooling reshape (build_step35_indexer_score), so this is a static fill; the
+        // multi-sequence/defrag alignment caveat is the decomposed path's documented TODO and
+        // applies identically here.
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_step35_cell_blk->buffer));
+        const int64_t n_kv = lctx.inp_step35_cell_blk->ne[0];
+        const int64_t B = hparams.indexer_csa_block > 0 ? hparams.indexer_csa_block : 8;
+        GGML_ASSERT(n_kv % B == 0);
+        int32_t * data = (int32_t *) lctx.inp_step35_cell_blk->data;
+        for (int64_t i = 0; i < n_kv; ++i) {
+            data[i] = (int32_t) (i / B);
+        }
+    }
+
     if (lctx.inp_dsa_sink) {
         // Per-sequence attention-sink boost for the DSA lightning indexer top-k selection.
         // inp_dsa_sink {n_kv, n_tokens}: 1e20 iff key cell i is one of query j's sequence's FIRST

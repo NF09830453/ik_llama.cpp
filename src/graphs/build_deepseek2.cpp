@@ -852,7 +852,7 @@ ggml_tensor * llm_build_context::build_deepseek2_layer_attention(
                         dsa_last_full_sorted = build_deepseek2_dsa_indexer(gf, il, q, cur, KQ_mask, inp_pos);
                         if (dsa_last_full_sorted && !dsa_fast_path) {
                             if (lctx.cparams.flash_attn) {
-                                last_sparse_mask_fa = ggml_indexer_mask(ctx0, KQ_mask, dsa_last_full_sorted);
+                                last_sparse_mask_fa = ggml_indexer_mask(ctx0, KQ_mask, dsa_last_full_sorted, 0.0f);
                             } else {
                                 last_sparse_mask = build_deepseek2_dsa_sparse_mask(dsa_last_full_sorted, KQ_mask);
                             }

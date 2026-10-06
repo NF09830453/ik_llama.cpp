@@ -10775,7 +10775,8 @@ struct ggml_tensor * ggml_blend(
 struct ggml_tensor * ggml_indexer_mask(
             struct ggml_context * ctx,
             struct ggml_tensor  * mask,
-            struct ggml_tensor  * topk) {
+            struct ggml_tensor  * topk,
+            float                 pen) {
     GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
     GGML_ASSERT(topk->type == GGML_TYPE_I32);
     // The mask may be padded along dim 1, so topk->ne[1] must be <= mask->ne[1]
@@ -10790,6 +10791,7 @@ struct ggml_tensor * ggml_indexer_mask(
     result->src[0] = mask;
     result->src[1] = topk;
     result->op = GGML_OP_MASK_TOPK;
+    memcpy(&result->op_params[0], &pen, sizeof(float));
 
     return result;
 }
