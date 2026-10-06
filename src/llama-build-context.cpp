@@ -3274,6 +3274,10 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
             std::vector<ggml_tensor*> attn(wq->n_device, nullptr);
             bool output_bias_added = false;
             int last_id = -1;
+            // running q-head offset of this device's shard: wq row-split shards are contiguous
+            // head ranges in device order (prepare_split_tensors(1)/prepare_delta_split accumulate
+            // ascending over non-null splits), so offset[id] = sum of shard head counts before id.
+            int64_t q_head_off = 0;
             for (int id = 0; id < wq->n_device; ++id) {
                 int il_cb = 1000*(id+1) + il;
                 auto split_wq = wq->splits[id];
@@ -3285,6 +3289,9 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 GGML_ASSERT((!split_wq && !split_wk && !split_wv && !split_wo && !split_kl && !split_vl) ||
                         (split_wq && split_wk && split_wv && split_wo && split_kl && split_vl));
                 if (!split_wq) continue;
+                const int64_t n_heads_dev = split_wq->ne[1] / hparams.n_embd_head_k(il);
+                const int64_t q_head_dev  = q_head_off;
+                q_head_off += n_heads_dev;
                 auto cur = get_input_tensor_sm_graph(ctx0, input, id);
                 if (pnd) {
                     cur = llm_do_split_post_norm(ctx0, cur, pnd, id, wq->n_device, "ffn_post_norm", il_cb, cb);
@@ -3346,7 +3353,19 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 cb(Qcur, "Qcur", il_cb);
                 cb(Kcur, "Kcur", il_cb);
                 if (inp_attn_scale) {
-                    Qcur = ggml_mul(ctx0, Qcur, inp_attn_scale);
+                    // per-q-head scale (step35 IK_SSMAX ssmax_s {n_head} reshaped {1,n_head,1}):
+                    // Qcur here holds THIS device's shard of q heads, so slice the matching
+                    // contiguous head range out of the full-width scale before broadcasting.
+                    ggml_tensor * q_scale = inp_attn_scale;
+                    if (q_scale->ne[1] != Qcur->ne[1]) {
+                        GGML_ASSERT(q_scale->ne[0] == 1 && q_scale->ne[1] == hparams.n_head(il));
+                        GGML_ASSERT(Qcur->ne[1] == n_heads_dev && q_head_dev + n_heads_dev <= q_scale->ne[1]);
+                        const size_t es = ggml_row_size(q_scale->type, 1);
+                        q_scale = ggml_cont(ctx0, ggml_view_2d(ctx0, q_scale, 1, n_heads_dev,
+                                es, q_head_dev*es));
+                        cb(q_scale, "qscale_split", il_cb);
+                    }
+                    Qcur = ggml_mul(ctx0, Qcur, q_scale);
                     cb(Qcur, "Qcur_temp_scaled", il_cb);
                 }
                 if (cparams.k_cache_hadamard) {

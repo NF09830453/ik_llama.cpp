@@ -671,7 +671,9 @@ ggml_cgraph * llm_build_context::build_step35() {
         }
         // IK_SSMAX per-q-head logit scale beta_h = s_h * ln(n): ssmax_s {n_head} reshaped to
         // {1, n_head, 1} broadcasts along Qcur's head axis (Qcur is {hd, n_head, n_tokens} at
-        // the inp_attn_scale mul site) -- scale * ln(n) folded into one ggml_scale on the
+        // the inp_attn_scale mul site; build_std_attention slices the {1,n_head,1} scale to each
+        // device's q-head shard under -sm graph/attn, mirroring the rope_factors split convention) --
+        // scale * ln(n) folded into one ggml_scale on the
         // weight view, no graph input, no new ops. Consumed by build_std_attention's existing
         // `Qcur = ggml_mul(Qcur, inp_attn_scale)` (post-rope: rope is orthogonal per pair so a
         // per-head scalar commutes -- scaling q post-rope == scaling logits).
