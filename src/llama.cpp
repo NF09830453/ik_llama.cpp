@@ -1437,6 +1437,18 @@ static bool llama_kv_cache_init(
         const bool is_mtp_tail_layer = llama_mtp_tail_uses_layer_cache(model) && i >= n_mtp_first_layer;
         //struct ggml_context * ctx = split_cache && !qnext_recurrent ? ctx_map.at(model.buft_layer[i].buft_matrix) : offload ? ctx_map.at(model.buft_layer[i].buft) : cache.ctxs.front();
         struct ggml_context * ctx = ((split_cache || replicate_mla) && !is_mtp_tail_layer) ? ctx_map.at(model.buft_layer[i].buft_matrix) : offload ? ctx_map.at(model.buft_layer[i].buft) : cache.ctxs.front();
+        // Indexer-key caches (kr_l / kp_l) must NOT live in the split buffer: split-buffer
+        // tensors carry a dummy base pointer (0x1000 + offset; real per-device storage hangs
+        // off ->extra, which these freshly-created caches never get wired to). Every indexer
+        // graph op that touches the parent tensor (the hadamard de-rotation, the cache cpy,
+        // top-k) would dereference that dummy -> "illegal memory access" at first touch, and
+        // the async error surfaces a few kernels later (observed as "HADAMARD failed" under
+        // -sm graph with 2 GPUs, IK_HADAMARD default). Allocate them in the layer's regular
+        // device buffer instead: the scheduler then pins the indexer ops to that device and
+        // moves inputs across the split itself. Single-GPU / non-split runs pass the same ctx
+        // and are unaffected.
+        ggml_context * ctx_idx = ((split_cache || replicate_mla) && !is_mtp_tail_layer)
+            ? ctx_map.at(model.buft_layer[i].buft) : ctx;
         ggml_tensor * k = nullptr;
         ggml_tensor * v = nullptr;
         ggml_tensor * s = nullptr;
@@ -1498,7 +1510,7 @@ static bool llama_kv_cache_init(
                     (!is_mtp_tail_layer || (model.arch == LLM_ARCH_GLM5NEXT && cparams.dsa))) {
                 const uint32_t idx_row = (model.arch == LLM_ARCH_GLM5NEXT)
                     ? 2 * hparams.indexer_head_size : hparams.indexer_head_size;
-                ggml_tensor * kr = ggml_new_tensor_2d(ctx, idx_type_k, idx_row, kv_size);
+                ggml_tensor * kr = ggml_new_tensor_2d(ctx_idx, idx_type_k, idx_row, kv_size);
                 ggml_format_name(kr, "cache_kr_l%d", i);
                 cache.kr_l[i] = kr;
             }
@@ -1596,12 +1608,12 @@ static bool llama_kv_cache_init(
 
             if (has_qwen4exp_indexer && hparams.is_qsa(i)) {
                 const uint32_t ratio = hparams.dsv4_compress_ratios[i];
-                ggml_tensor * idxk = ggml_new_tensor_2d(ctx, idx_type_k, hparams.indexer_head_size, cache.rows(i));
+                ggml_tensor * idxk = ggml_new_tensor_2d(ctx_idx, idx_type_k, hparams.indexer_head_size, cache.rows(i));
                 ggml_format_name(idxk, "cache_kr_l%d", i);
                 cache.kr_l[i] = idxk;
 
                 // one pooled key per block of `ratio` positions, so this costs 1/ratio of the raw cache
-                ggml_tensor * idxp = ggml_new_tensor_2d(ctx, idx_type_k, hparams.indexer_head_size,
+                ggml_tensor * idxp = ggml_new_tensor_2d(ctx_idx, idx_type_k, hparams.indexer_head_size,
                         (cache.rows(i) + ratio - 1)/ratio);
                 ggml_format_name(idxp, "cache_kp_l%d", i);
                 cache.kp_l[i] = idxp;
@@ -1611,7 +1623,7 @@ static bool llama_kv_cache_init(
             // on full-attn layers only and skipped for the MTP tail (no indexer tensors there).
             // Mirror of llama_model::cache_size()'s STEP35 branch.
             if (has_step35_indexer && hparams.indexer_is_full[i] && !is_mtp_tail_layer) {
-                ggml_tensor * idxk = ggml_new_tensor_2d(ctx, idx_type_k, hparams.indexer_head_size, cache.rows(i));
+                ggml_tensor * idxk = ggml_new_tensor_2d(ctx_idx, idx_type_k, hparams.indexer_head_size, cache.rows(i));
                 ggml_format_name(idxk, "cache_kr_l%d", i);
                 cache.kr_l[i] = idxk;
             }
@@ -1638,7 +1650,7 @@ static bool llama_kv_cache_init(
                 // 128-d indexer key. Position-indexed like everything else in the cache, so
                 // the same rollback invariant applies: committed columns never change.
                 if (has_openpangu_dsa_indexer && i < n_mtp_first_layer && !hparams.swa_layers[i]) {
-                    ggml_tensor * idxk = ggml_new_tensor_2d(ctx, idx_type_k, hparams.indexer_head_size, kv_size);
+                    ggml_tensor * idxk = ggml_new_tensor_2d(ctx_idx, idx_type_k, hparams.indexer_head_size, kv_size);
                     ggml_format_name(idxk, "cache_kr_l%d", i);
                     cache.kr_l[i] = idxk;
                 }
