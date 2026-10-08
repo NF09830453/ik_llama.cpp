@@ -2681,14 +2681,17 @@ static bool llama_kv_cache_seq_rm(
     }
 
     // a compacted layer holds one contiguous range, so a refusal must leave the cache untouched
+    // NOTE: live_swa()==0 with pos_base_swa>0 is a LEGAL rebased-empty state
+    // (llama_kv_cache_seq_swa_rebase): the window is empty but anchored at the next write
+    // position, keeping row(pos) = sink_rows + pos - pos_base_swa aligned. cur_end == base
+    // then makes every branch below behave: trims below base refuse (no rows to lose),
+    // trims at/above base skip the compact branch, p0==0 resets to the 0-frame.
     bool      compact_apply = false;
     uint32_t  compact_head  = 0;
     llama_pos compact_base  = 0;
     // seq_id > 0 owns no compacted rows here (single-sequence arch), so it must not move the map
     if (cache.any_compacted() && seq_id <= 0 && p1 > p0) {
         const llama_pos cur_end = cache.pos_base_swa + (llama_pos) cache.live_swa();
-        GGML_ASSERT((cache.live_swa() > 0 || cache.pos_base_swa == 0) &&
-                "compacted window cannot be empty above position 0");
         if (p0 < cur_end && p1 > cache.pos_base_swa) {
             if (p1 < cur_end) {
                 LLAMA_LOG_ERROR("%s: --swa-compress cannot remove the interior range [%d, %d): "
@@ -10759,6 +10762,26 @@ bool llama_kv_cache_seq_rm(struct llama_context * ctx, llama_seq_id seq_id, llam
         llama_reset_dsv4_state(ctx, seq_id);
     }
     return result;
+}
+
+bool llama_kv_cache_seq_swa_rebase(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos) {
+    // Hard-clear the sequence and anchor the compacted SWA window so the next write lands
+    // at `pos`: pos_base_swa := pos, head_swa := sink_rows, live 0. Keeps the row mapping
+    // row(pos') = sink_rows + pos' - pos_base_swa aligned for a cache that must rejoin a
+    // sequence MID-STREAM (e.g. the MTP companion ctx after the main cache rewound below
+    // the companion's compaction floor -- its old rows are gone and can never be rebuilt,
+    // so an empty-but-anchored window is the only consistent state). Plain seq_rm cannot
+    // do this: its p0==0 reset anchors at 0, which only works for full restarts at pos 0.
+    // Single-sequence by compacted-cache construction (n_seq_max == 1 is enforced at init).
+    if (!llama_kv_cache_seq_rm(ctx, seq_id, -1, -1)) {
+        return false;
+    }
+    auto & cache = ctx->kv_self;
+    if (cache.any_compacted()) {
+        cache.pos_base_swa = pos;
+        cache.head_swa     = cache.sink_rows;
+    }
+    return true;
 }
 
 void llama_kv_cache_seq_cp(struct llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {

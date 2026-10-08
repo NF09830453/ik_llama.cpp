@@ -3008,7 +3008,20 @@ bool common_speculative_trim_sequence(
         llama_pos pos_begin) {
     const bool target_trimmed = llama_kv_cache_seq_rm(ctx, seq_id, pos_begin, -1);
     if (auto * ctx_mtp = common_speculative_get_companion_ctx(spec); ctx_mtp != nullptr) {
-        return target_trimmed && llama_kv_cache_seq_rm(ctx_mtp, seq_id, pos_begin, -1);
+        if (!llama_kv_cache_seq_rm(ctx_mtp, seq_id, pos_begin, -1)) {
+            // --swa-compress: the companion is compacted too, and nothing restores it on a
+            // checkpoint rewind, so its rewind floor (pos_base_swa + window) can sit ABOVE
+            // the divergence point while the main cache rewinds fine. The companion only
+            // carries draft-round state (its rows need main-model hidden states that no
+            // longer exist, so they can never be rebuilt retroactively) -- refuse to let
+            // that escalate: rebase the companion at the rewind point and keep the main
+            // trim. Escalating here (the old AND) forced a full slot wipe + full prompt
+            // reprocess on every turn whose previous generation pushed the companion floor
+            // past the divergence point (_swa_compress_issue.txt, turns 4450/6213/8196).
+            // A plain clear would NOT suffice: it anchors the window at 0, desyncing the
+            // row(pos) mapping for a cache rejoining mid-stream -- hence the rebase.
+            llama_kv_cache_seq_swa_rebase(ctx_mtp, seq_id, pos_begin);
+        }
     }
 
     return target_trimmed;
