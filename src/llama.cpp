@@ -1332,9 +1332,20 @@ static bool llama_kv_cache_init(
         replicate_mla = true;
     }
 
-    if (cache.any_compacted() && ((split_cache && model.arch != LLM_ARCH_GEMMA4) || replicate_mla)) {
+    // Compacted (--swa-compress) caches under split mode graph/attn are HEAD-sharded: every
+    // device shard holds all cells for its head subset, so llama_kv_cache_compact_swa compacts
+    // each shard with independent row moves (no cross-device semantics). GEMMA4 was validated
+    // first (ec6fb235); STEP35 mirrors it. Replicated MLA caches stay refused (the compaction
+    // plumbing has no replica branch).
+    if (cache.any_compacted() && ((split_cache && model.arch != LLM_ARCH_GEMMA4 && model.arch != LLM_ARCH_STEP35) || replicate_mla)) {
         LLAMA_LOG_ERROR("%s: --swa-compress is not supported with a replicated KV cache "
                         "(split mode graph/attn); run without --swa-compress or with a single device\n", __func__);
+        return false;
+    }
+    // split compaction moves are FA-only (transposed-V row moves are unplumbed); refuse at
+    // init instead of letting llama_kv_cache_compact_swa's GGML_ASSERT abort mid-generation
+    if (cache.any_compacted() && split_cache && cache.v_trans) {
+        LLAMA_LOG_ERROR("%s: --swa-compress with split mode graph/attn requires flash attention (-fa)\n", __func__);
         return false;
     }
 
@@ -1778,6 +1789,19 @@ static bool llama_kv_cache_init(
     }
 #endif
 
+    // Invariant: kr_l / kp_l never carry split extras. They are allocated in the layer's regular
+    // device buffer (ctx_idx above), and llama_data_write/read's split stitch helpers derive
+    // shard row widths from wk/wv surrogates that cannot describe indexer-key shard layouts:
+    // a wired kr_l extra would misderive widths through state save/restore (ckpt PARTIAL_ONLY
+    // carries compacted indexer windows). compact_swa keeps a split branch for kr_l defensively,
+    // but nothing may set the extra while the stitch helpers assume wk/wv geometry.
+    for (size_t il = 0; il < cache.kr_l.size(); ++il) {
+        GGML_ASSERT(cache.kr_l[il] == nullptr || cache.kr_l[il]->extra == nullptr);
+    }
+    for (size_t il = 0; il < cache.kp_l.size(); ++il) {
+        GGML_ASSERT(cache.kp_l[il] == nullptr || cache.kp_l[il]->extra == nullptr);
+    }
+
     return true;
 }
 
@@ -1974,6 +1998,7 @@ static void llama_kv_cache_compact_swa(struct llama_context & lctx, uint32_t n_t
 
         if (kl->extra) {
             // Handle cache split between 2 or more devices
+            GGML_ASSERT(!cache.v_trans); // split compaction is FA-only (refused at init)
             auto k_extra = (ggml_split_tensor_t *)kl->extra;
             auto vl = il < cache.v_l.size() ? cache.v_l[il] : nullptr;
             ggml_split_tensor_t * v_extra = nullptr;
@@ -1981,7 +2006,6 @@ static void llama_kv_cache_compact_swa(struct llama_context & lctx, uint32_t n_t
             int64_t v_tot = 0;
             if (vl) {
                 GGML_ASSERT(vl->extra);
-                GGML_ASSERT(!cache.v_trans); // split mode graph only works with FA enabled
                 n_embd_v_row = llama_kv_v_row_embd(lctx.model, lctx.model.hparams, il);
                 v_extra = (ggml_split_tensor_t *)vl->extra;
                 for (int is = 0; is < v_extra->n_device; ++is) {
@@ -1993,7 +2017,10 @@ static void llama_kv_cache_compact_swa(struct llama_context & lctx, uint32_t n_t
                 if (k_split) {
                     const size_t rows_per_pos = (size_t) k_split->ne[1] / cache_rows;
                     const size_t stride = k_split->nb[1] * rows_per_pos;
-                    copy_bytes(k_split, (size_t) src_row*stride, (size_t) dst_row*stride, (size_t) W*stride);
+                    // n_keep, not W: matches the non-split branch below. Both coincide whenever
+                    // compaction fires (drop > 0 requires live > W, i.e. n_keep == W), but spelling
+                    // W here lets retention arithmetic diverge exactly in rewind-after-fire edges
+                    copy_bytes(k_split, (size_t) src_row*stride, (size_t) dst_row*stride, (size_t) n_keep*stride);
                 }
                 auto v_split = v_extra ? v_extra->splits[is] : nullptr;
                 if (v_split) {
@@ -2006,7 +2033,7 @@ static void llama_kv_cache_compact_swa(struct llama_context & lctx, uint32_t n_t
                     const size_t v_aux = v_tot_stride * v_split->ne[0];
                     GGML_ASSERT(v_aux % v_tot == 0);
                     const size_t v_stride = v_aux / v_tot;
-                    copy_bytes(v_split, (size_t) src_row*v_stride, (size_t) dst_row*v_stride, (size_t) W*v_stride);
+                    copy_bytes(v_split, (size_t) src_row*v_stride, (size_t) dst_row*v_stride, (size_t) n_keep*v_stride);
                 }
             }
             continue;
@@ -11120,6 +11147,10 @@ bool llama_save_session_file(struct llama_context * ctx, const char * path_sessi
     return llama_state_save_file(ctx, path_session, tokens, n_token_count);
 }
 
+// Surrogate for a row-major KV-cache tensor's shard geometry: wk/wv carry split extras whose
+// shards mirror the k_l/v_l cache shard widths (each weight shard's ne[1] = shard row width).
+// ONLY valid for k_l/v_l — indexer caches kr_l/kp_l have unrelated shard layouts and must never
+// carry split extras (asserted at the end of llama_kv_cache_init).
 static inline ggml_tensor * get_kv_cache_split_tensor(const ggml_tensor * tensor, const llama_layer & l) {
     if (!l.wv) return l.wk;
     bool use_V_for_K = l.attn_k_norm && l.attn_k_norm->ne[0] == l.wk->ne[1] ? true : false;
@@ -12420,6 +12451,8 @@ struct llama_data_read {
                 const uint32_t kr_dst     = kr_compact ? kv_self.sink_rows  : kv_self.head;
 
                 if (kr_rows) {
+                    // kr_l extras are an invariant impossibility (see the llama_kv_cache_init tail
+                    // assert); the split stitch below is legacy scaffolding for indexer caches
                     if (kv_self.kr_l[il]->extra) {
                         read_kv_cache_data_split(ctx, kv_self.kr_l[il], read(kr_rows * kr_size_row), kr_dst, kr_size_row, kr_rows, il);
                     } else {
