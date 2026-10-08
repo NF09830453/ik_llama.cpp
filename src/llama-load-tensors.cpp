@@ -1440,14 +1440,25 @@ bool create_tensors_helper::create_step35_tensors(const LLM_TN & tn) {
             const int64_t idx_head   = hparams.indexer_head_size; // proxy_dim (sparse_config.proxy_dim)
             const int64_t idx_n_head = hparams.indexer_n_head;    // sparse_config.sparse_indexer_num_heads
             const int idx_flags = optional_layer_flags;
-            layer.indexer_q        = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", i), {n_embd, idx_head * idx_n_head}, idx_flags);
-            layer.indexer_k        = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_K_PROJ, "weight", i), {n_embd, idx_head}, idx_flags);
-            layer.indexer_z        = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_Z, "weight", i), {n_embd, idx_head}, idx_flags);
-            layer.indexer_w        = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_W, "weight", i), {n_embd, idx_n_head}, idx_flags);
-            layer.indexer_q_norm   = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_Q_NORM, "weight", i), {idx_head}, idx_flags);
-            layer.indexer_k_norm   = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_K_NORM, "weight", i), {idx_head}, idx_flags);
-            layer.indexer_k_norm_b = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_K_NORM, "bias", i), {idx_head}, idx_flags);
-            layer.indexer_ssmax_s  = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_SSMAX_S, i), {n_head_l}, idx_flags);
+            // Indexer weights must NOT live in the split buffer (same rule as the kr_l/kp_l
+            // caches, llama.cpp llama_kv_cache_init comment, fix 4f32e725): split-buffer tensors
+            // carry a dummy base pointer (0x1000 + offset; real per-device storage hangs off
+            // ->extra, which these tensors never get wired to -- there is no
+            // prepare_split_tensors call for them and build_step35.cpp consumes them raw via
+            // ggml_mul_mat). Under -sm graph the first indexer mul_mat dereferenced the dummy
+            // base -> illegal memory access at blk.{first full-attn layer}.indexer.z.weight.
+            // Allocate them in the layer's regular device buffer instead: the scheduler pins the
+            // indexer ops to that device and moves inputs across the split itself. Single-GPU /
+            // non-split runs pass the same ctx and are unaffected.
+            ggml_context * ctx_idx = ctx_for_layer(i);
+            layer.indexer_q        = create_tensor(ctx_idx, tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", i), {n_embd, idx_head * idx_n_head}, idx_flags);
+            layer.indexer_k        = create_tensor(ctx_idx, tn(LLM_TENSOR_INDEXER_K_PROJ, "weight", i), {n_embd, idx_head}, idx_flags);
+            layer.indexer_z        = create_tensor(ctx_idx, tn(LLM_TENSOR_INDEXER_Z, "weight", i), {n_embd, idx_head}, idx_flags);
+            layer.indexer_w        = create_tensor(ctx_idx, tn(LLM_TENSOR_INDEXER_W, "weight", i), {n_embd, idx_n_head}, idx_flags);
+            layer.indexer_q_norm   = create_tensor(ctx_idx, tn(LLM_TENSOR_INDEXER_Q_NORM, "weight", i), {idx_head}, idx_flags);
+            layer.indexer_k_norm   = create_tensor(ctx_idx, tn(LLM_TENSOR_INDEXER_K_NORM, "weight", i), {idx_head}, idx_flags);
+            layer.indexer_k_norm_b = create_tensor(ctx_idx, tn(LLM_TENSOR_INDEXER_K_NORM, "bias", i), {idx_head}, idx_flags);
+            layer.indexer_ssmax_s  = create_tensor(ctx_idx, tn(LLM_TENSOR_INDEXER_SSMAX_S, i), {n_head_l}, idx_flags);
         }
     }
     return use_mmap_buffer;
