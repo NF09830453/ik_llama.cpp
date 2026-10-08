@@ -3414,7 +3414,7 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
     }
     ggml_cuda_pool_alloc<char> final_dst_contiguous(ctx.pool());
     if (fuse_down) {
-        final_dst.data = final_dst_contiguous.alloc(ggml_nelements(next));
+        final_dst.data = final_dst_contiguous.alloc(sizeof(float)*ggml_nelements(next));  // bytes, not floats (was 4x underallocated)
         final_dst.src[1] = &dst_row;
     }
 
