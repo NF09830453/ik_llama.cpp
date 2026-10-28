@@ -1,8 +1,5 @@
 #include "indexer_pack.cuh"
 
-#include <cstdio>
-#include <cstdlib>
-
 // TODO(c12, follow-up): pass inp_pos/kv_seqlen into indexer_pack like the Triton
 // _decode_pack_kernel reference does; derive the force-append set arithmetically from
 // n_kv (current partial block) and drop the seed + band01 tensors from the decode graph
@@ -10,10 +7,6 @@
 
 // Max n_kv supported by shared-memory bitmask: 131072 bits = 16 KB shared memory
 #define GSA_PACK_MAX_WORDS 4096
-
-// Telemetry (IK_GSA_PACK_TELEMETRY=1): [rows, marks, cells, over], accumulated across
-// calls until read+reset by the host op. dups = marks - cells (topk self-duplicates).
-static __device__ unsigned long long g_gsa_tel[4];
 
 template <typename seed_t>
 static __global__ void k_indexer_pack(
@@ -46,12 +39,10 @@ static __global__ void k_indexer_pack(
     int          * dst_row  = (int          *)((char *)dst + (size_t)row * nb_dst1);
 
     // 1. Mark all causally-visible topk cells in the bitmask (automatically deduplicates!)
-    int marks = 0;
     for (int j = tid; j < kept; j += nth) {
         const int id = topk_row[j];
         if (id >= 0 && id < n_kv && !isinf((float)seed_row[id])) {
             atomicOr(&seen[id >> 5], 1u << (id & 31));
-            ++marks;
         }
     }
 
@@ -59,7 +50,6 @@ static __global__ void k_indexer_pack(
     for (int c = tid; c < n_kv; c += nth) {
         if (band_row[c] > 0.5f && !isinf((float)seed_row[c])) {
             atomicOr(&seen[c >> 5], 1u << (c & 31));
-            ++marks;
         }
     }
     __syncthreads();
@@ -85,7 +75,6 @@ static __global__ void k_indexer_pack(
     }
     __syncthreads();
     int out_idx = s_scan[tid];
-    int over = 0;
     for (int w = tid; w < n_words; w += nth) {
         uint32_t mask = seen[w];
         while (mask) {
@@ -93,8 +82,6 @@ static __global__ void k_indexer_pack(
             mask &= mask - 1;
             if (out_idx < total) {
                 dst_row[out_idx] = ((w << 5) + bit) | (1 << 24);
-            } else {
-                ++over; // unreachable: |union| <= kept + B = total
             }
             ++out_idx;
         }
@@ -108,25 +95,6 @@ static __global__ void k_indexer_pack(
     const int valid_count = s_count;
     for (int j = valid_count + tid; j < total; j += nth) {
         dst_row[j] = -1;
-    }
-
-    // Telemetry: block-reduce per-thread counters, one global atomic per metric per block.
-    __shared__ int s_tm, s_tc, s_tv;
-    if (tid == 0) {
-        s_tm = 0;
-        s_tc = 0;
-        s_tv = 0;
-    }
-    __syncthreads();
-    atomicAdd(&s_tm, marks);
-    atomicAdd(&s_tc, cnt);
-    atomicAdd(&s_tv, over);
-    __syncthreads();
-    if (tid == 0) {
-        atomicAdd(&g_gsa_tel[0], 1ULL);
-        atomicAdd(&g_gsa_tel[1], (unsigned long long)s_tm);
-        atomicAdd(&g_gsa_tel[2], (unsigned long long)s_tc);
-        atomicAdd(&g_gsa_tel[3], (unsigned long long)s_tv);
     }
 }
 
@@ -158,14 +126,4 @@ void ggml_cuda_op_indexer_pack(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             topk->nb[1], seed->nb[1], band->nb[1], dst->nb[1]);
     }
     CUDA_CHECK(cudaGetLastError());
-
-    static const bool tel = getenv("IK_GSA_PACK_TELEMETRY") != nullptr;
-    if (tel) {
-        unsigned long long h[4] = {0, 0, 0, 0};
-        static const unsigned long long z[4] = {0, 0, 0, 0};
-        CUDA_CHECK(cudaMemcpyFromSymbol(h, g_gsa_tel, sizeof(h)));
-        CUDA_CHECK(cudaMemcpyToSymbol(g_gsa_tel, z, sizeof(z)));
-        fprintf(stderr, "%s: rows=%llu marks=%llu cells=%llu dups=%llu over=%llu\n", __func__,
-                h[0], h[1], h[2], h[1] > h[2] ? h[1] - h[2] : 0ULL, h[3]);
-    }
 }

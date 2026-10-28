@@ -1,6 +1,9 @@
+
 #include "indexer_pack.cuh"
 
-#define GSA_MAX_H 16
+#define GSA_MAX_D_PER_LANE 16 // supports head_dim up to 512 (16 * 32)
+#define GSA_N_WARPS 8
+#define GSA_NTH (GSA_N_WARPS * 32)
 
 static __device__ inline float gsa_dequant(ggml_type type, const char * row, int i) {
     switch (type) {
@@ -62,114 +65,127 @@ static __global__ void k_gather_sparse_attn(
         char       * __restrict__ dst,
         const float scale, const int d, const int H, const int K,
         const ggml_type k_type, const ggml_type v_type,
-        const size_t k_nbytes, const size_t v_nbytes, const int n_kv,
+        const int n_kv,
         const size_t nb_q1, const size_t nb_q2,
         const size_t nb_k1, const size_t nb_k2,
         const size_t nb_v1, const size_t nb_v2,
         const size_t nb_o1, const size_t nb_o2) {
-    const int t    = blockIdx.y;
-    const int ikvh = blockIdx.x;
+    const int qh   = blockIdx.x;        // query head index [0 .. n_head - 1]
+    const int t    = blockIdx.y;        // token index      [0 .. n_tokens - 1]
+    const int ikvh = qh / H;            // kv head index    [0 .. n_head_kv - 1]
     const int tid  = threadIdx.x;
-    const int nth  = blockDim.x;
-    const int warp = tid / 32;
-    const int lane = tid % 32;
-    const int n_warps = nth / 32;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
 
-    extern __shared__ float data[];
-    float * q_s   = data;                  // [H * d]
-    float * acc_s = q_s + H * d;           // [H * d]
-    float * kv_s  = acc_s + H * d;         // [d] dequantized K or V row buffer
-    float * red_s = kv_s + d;              // [H * n_warps]
-    float * m_s   = red_s + H * n_warps;   // [H]
-    float * l_s   = m_s + H;               // [H]
-    float * r_s   = l_s + H;               // [H]
-    float * p_s   = r_s + H;               // [H]
-
-    for (int i = tid; i < H * d; i += nth) {
-        const int h   = i / d;
-        const int dim = i % d;
-        q_s[i]   = *(const float *)(q + (size_t)t * nb_q1 + (size_t)(ikvh * H + h) * nb_q2 + (size_t)dim * sizeof(float));
-        acc_s[i] = 0.0f;
+    // Load Q into registers for this query head
+    float q_reg[GSA_MAX_D_PER_LANE];
+    float acc_reg[GSA_MAX_D_PER_LANE];
+    const char * q_ptr = q + (size_t)t * nb_q1 + (size_t)qh * nb_q2;
+    #pragma unroll
+    for (int c = 0; c < GSA_MAX_D_PER_LANE; ++c) {
+        const int dim = c * 32 + lane;
+        q_reg[c]   = (dim < d) ? *(const float *)(q_ptr + (size_t)dim * sizeof(float)) : 0.0f;
+        acc_reg[c] = 0.0f;
     }
-    if (tid < H) {
-        m_s[tid] = -INFINITY;
-        l_s[tid] = 0.0f;
-    }
-    __syncthreads();
 
-    packed += (size_t)t * K;
-    for (int base = 0; base < K; ++base) {
-        const int meta = packed[base];
-        if (meta < 0 || (meta >> 24) <= 0) {
+    float m_w = -INFINITY;
+    float l_w = 0.0f;
+
+    const int  * packed_row = packed + (size_t)t * K;
+    const char * k_head     = k + (size_t)ikvh * nb_k2;
+    const char * v_head     = v + (size_t)ikvh * nb_v2;
+
+    // Each warp independently processes every 8th slot with ZERO __syncthreads()!
+    for (int base = warp; base < K; base += GSA_N_WARPS) {
+        const int meta = packed_row[base];
+        if (meta < 0) {
+            break; // k_indexer_pack compacts valid cells to [0 .. valid_count - 1]
+        }
+        if ((meta >> 24) <= 0) {
             continue;
         }
         const int row = meta & 0xffffff;
-        const size_t koff = (size_t)ikvh * nb_k2 + (size_t)row * nb_k1;
-        const size_t voff = (size_t)ikvh * nb_v2 + (size_t)row * nb_v1;
-        if (row >= n_kv || koff + nb_k1 > k_nbytes || voff + nb_v1 > v_nbytes) {
+        if (row >= n_kv) {
             continue;
         }
 
-        // 1. Dequantize K row ONCE for all H query heads in the GQA group
-        const char * krow = k + koff;
-        for (int i = tid; i < d; i += nth) {
-            kv_s[i] = gsa_dequant(k_type, krow, i);
+        const char * krow = k_head + (size_t)row * nb_k1;
+        float dot = 0.0f;
+        for (int c = 0; c * 32 < d; ++c) {
+            const int dim = c * 32 + lane;
+            if (dim < d) {
+                dot += q_reg[c] * gsa_dequant(k_type, krow, dim);
+            }
         }
-        __syncthreads();
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            dot += __shfl_xor_sync(0xffffffff, dot, offset);
+        }
 
-        // 2. Compute Q*K dot products across all H heads
-        for (int h = 0; h < H; ++h) {
-            float partial = 0.0f;
-            for (int i = tid; i < d; i += nth) {
-                partial += q_s[h * d + i] * kv_s[i];
-            }
-            #pragma unroll
-            for (int offset = 16; offset > 0; offset >>= 1) {
-                partial += __shfl_xor_sync(0xffffffff, partial, offset);
-            }
-            if (lane == 0) {
-                red_s[h * n_warps + warp] = partial;
-            }
-        }
-        __syncthreads();
+        const float sc     = scale * dot;
+        const float m_prev = m_w;
+        const float mn     = fmaxf(m_prev, sc);
+        const float r      = (m_prev == -INFINITY) ? 0.0f : expf(m_prev - mn);
+        const float p      = expf(sc - mn);
+        l_w = l_w * r + p;
+        m_w = mn;
 
-        // 3. Online softmax state update (1 thread per head in parallel) + dequantize V row ONCE
-        if (tid < H) {
-            float s = 0.0f;
-            for (int w = 0; w < n_warps; ++w) {
-                s += red_s[tid * n_warps + w];
+        const char * vrow = v_head + (size_t)row * nb_v1;
+        for (int c = 0; c * 32 < d; ++c) {
+            const int dim = c * 32 + lane;
+            if (dim < d) {
+                acc_reg[c] = acc_reg[c] * r + p * gsa_dequant(v_type, vrow, dim);
             }
-            const float sc = scale * s;
-            const float m_prev = m_s[tid];
-            const float mn = fmaxf(m_prev, sc);
-            const float r  = (m_prev == -INFINITY) ? 0.0f : expf(m_prev - mn);
-            const float p  = expf(sc - mn);
-            r_s[tid] = r;
-            p_s[tid] = p;
-            l_s[tid] = l_s[tid] * r + p;
-            m_s[tid] = mn;
         }
-        const char * vrow = v + voff;
-        for (int i = tid; i < d; i += nth) {
-            kv_s[i] = gsa_dequant(v_type, vrow, i);
-        }
-        __syncthreads();
-
-        // 4. Rescale and accumulate V across all H heads
-        for (int i = tid; i < H * d; i += nth) {
-            const int h   = i / d;
-            const int dim = i % d;
-            acc_s[i] = acc_s[i] * r_s[h] + p_s[h] * kv_s[dim];
-        }
-        __syncthreads();
     }
 
-    // Write output using byte-pointer `char * dst`
-    for (int i = tid; i < H * d; i += nth) {
-        const int h   = i / d;
-        const int dim = i % d;
-        *(float *)(dst + (size_t)t * nb_o2 + (size_t)(ikvh * H + h) * nb_o1 + (size_t)dim * sizeof(float)) =
-            l_s[h] > 0.0f ? acc_s[i] / l_s[h] : 0.0f;
+    // Cross-warp Flash-Decoding combine in shared memory
+    extern __shared__ float smem[];
+    float * s_m   = smem;                           // [GSA_N_WARPS]
+    float * s_l   = s_m + GSA_N_WARPS;              // [GSA_N_WARPS]
+    float * s_acc = s_l + GSA_N_WARPS;              // [GSA_N_WARPS * d]
+
+    if (lane == 0) {
+        s_m[warp] = m_w;
+        s_l[warp] = l_w;
+    }
+    for (int c = 0; c * 32 < d; ++c) {
+        const int dim = c * 32 + lane;
+        if (dim < d) {
+            s_acc[warp * d + dim] = acc_reg[c];
+        }
+    }
+    __syncthreads();
+
+    // Warp 0 combines the 8 warp accumulators and writes dst
+    if (warp == 0) {
+        float m_global = -INFINITY;
+        #pragma unroll
+        for (int w = 0; w < GSA_N_WARPS; ++w) {
+            m_global = fmaxf(m_global, s_m[w]);
+        }
+
+        float l_global = 0.0f;
+        float w_scale[GSA_N_WARPS];
+        #pragma unroll
+        for (int w = 0; w < GSA_N_WARPS; ++w) {
+            w_scale[w] = (s_m[w] == -INFINITY || m_global == -INFINITY) ? 0.0f : expf(s_m[w] - m_global);
+            l_global  += s_l[w] * w_scale[w];
+        }
+
+        char * dst_ptr = dst + (size_t)t * nb_o2 + (size_t)qh * nb_o1;
+        const float inv_l = (l_global > 0.0f) ? (1.0f / l_global) : 0.0f;
+        for (int c = 0; c * 32 < d; ++c) {
+            const int dim = c * 32 + lane;
+            if (dim < d) {
+                float sum = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < GSA_N_WARPS; ++w) {
+                    sum += s_acc[w * d + dim] * w_scale[w];
+                }
+                *(float *)(dst_ptr + (size_t)dim * sizeof(float)) = sum * inv_l;
+            }
+        }
     }
 }
 
@@ -184,7 +200,7 @@ void ggml_cuda_op_gather_sparse_attn(ggml_backend_cuda_context & ctx, ggml_tenso
     const int H      = n_head / (int)k->ne[2];
     const int K      = (int)packed->ne[0];
 
-    GGML_ASSERT(H <= GSA_MAX_H);
+    GGML_ASSERT(d <= GSA_MAX_D_PER_LANE * 32);
     if (!ggml_gsa_kv_supported(k->type, v->type)) {
         GGML_ABORT("unsupported K/V type combo for gather_sparse_attn");
     }
@@ -192,16 +208,13 @@ void ggml_cuda_op_gather_sparse_attn(ggml_backend_cuda_context & ctx, ggml_tenso
     float scale;
     memcpy(&scale, dst->op_params, sizeof(scale));
 
-    dim3 grid(k->ne[2], (int)q->ne[1], 1);
-    constexpr int nth = 128;
-    const int n_warps = nth / 32;
-    const int smem = (2 * H * d + d + H * n_warps + 4 * H) * sizeof(float);
+    dim3 grid(n_head, (int)q->ne[1], 1);
+    const size_t smem = (size_t)(2 * GSA_N_WARPS + GSA_N_WARPS * d) * sizeof(float);
 
-    k_gather_sparse_attn<<<grid, nth, smem, ctx.stream()>>>(
+    k_gather_sparse_attn<<<grid, GSA_NTH, smem, ctx.stream()>>>(
         (const char *)q->data, (const char *)k->data, (const char *)v->data,
         (const int *)packed->data, (char *)dst->data, scale, d, H, K,
-        k->type, v->type,
-        ggml_nbytes(k), ggml_nbytes(v), (int)k->ne[1],
+        k->type, v->type, (int)k->ne[1],
         q->nb[1], q->nb[2], k->nb[1], k->nb[2], v->nb[1], v->nb[2],
         dst->nb[1], dst->nb[2]);
     CUDA_CHECK(cudaGetLastError());
