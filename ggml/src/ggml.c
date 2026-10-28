@@ -10758,6 +10758,7 @@ struct ggml_tensor * ggml_gather_sparse_attn(
         float                 scale) {
     GGML_ASSERT(q->type == GGML_TYPE_F32);
     GGML_ASSERT(q->ne[1] == packed->ne[1]);
+    GGML_ASSERT(k->ne[0] == v->ne[0]);
     GGML_ASSERT(k->ne[0] == q->ne[0] && k->ne[1] == v->ne[1] && k->ne[2] == v->ne[2]);
     GGML_ASSERT(q->ne[2] % k->ne[2] == 0);
     GGML_ASSERT(packed->type == GGML_TYPE_I32);
@@ -10774,6 +10775,35 @@ struct ggml_tensor * ggml_gather_sparse_attn(
     result->src[3] = packed;
 
     return result;
+}
+
+bool ggml_gsa_kv_supported(enum ggml_type kt, enum ggml_type vt) {
+    switch (kt) {
+        case GGML_TYPE_F16:
+        case GGML_TYPE_F32:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q6_0:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+            break;
+        default:
+            return false;
+    }
+    switch (vt) {
+        case GGML_TYPE_F16:
+        case GGML_TYPE_F32:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q6_0:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+            return true;
+        default:
+            return false;
+    }
 }
 
 struct ggml_tensor * ggml_sinkhorn(
@@ -23397,7 +23427,7 @@ static void ggml_compute_forward_pad_f32(
         for (int ib = ith; ib < nblocks; ib += nth) {
             int first = ib*k_block_size;
             int last  = MIN(first + k_block_size, nelem);
-            // 
+            //
             //int ii = first;
             //int i3 = ii/(ne0*ne1*ne2); ii -= i3*ne0*ne1*ne2;
             //int i2 = ii/(ne0*ne1    ); ii -= i2*ne0*ne1;

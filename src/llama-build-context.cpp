@@ -2323,16 +2323,9 @@ static ggml_tensor * llm_build_kqv(
 
         if (sparse_pack) {
             GGML_ASSERT(!sinks && n_swa == 0);
-            // kernel-supported K/V combos only (must mirror ggml_gsa_kv_supported in
-            // ggml-cuda/indexer_pack.cuh); anything else falls back to the fused mask
-            // (packed subgraph becomes dead weight in the graph but is never launched)
-            const auto gsa_kv_ok = [](ggml_type t) {
-                return t == GGML_TYPE_F16 || t == GGML_TYPE_F32 || t == GGML_TYPE_Q8_0 ||
-                       t == GGML_TYPE_Q6_0 || t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q5_1 ||
-                       t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1;
-            };
-            const bool kv_ok = gsa_kv_ok(k->type) && gsa_kv_ok(v->type);
-            if (kv_ok) {
+            // builder already gated the pack on ggml_gsa_kv_supported; re-check here as
+            // defense in depth (fallback = dense FA on the plain causal mask)
+            if (ggml_gsa_kv_supported(k->type, v->type)) {
                 cur = ggml_gather_sparse_attn(ctx, q, k, v, sparse_pack, kq_scale);
                 cb(cur, "fa_gather", il);
             } else {

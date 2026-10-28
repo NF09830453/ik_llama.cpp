@@ -2751,6 +2751,10 @@ extern "C" {
             struct ggml_tensor  * packed,
             float                 scale);
 
+    // K/V cache types the gather_sparse_attn kernel supports; builders should gate the
+    // packed subgraph on this so the node never exists unless its consumer runs it.
+    GGML_API bool ggml_gsa_kv_supported(enum ggml_type kt, enum ggml_type vt);
+
     // Step-5 CSA region compress (fused): per-(region, dim) softmax(z)-weighted mean of the
     // proxy keys over each region's tokens -- the official semantics of
     // _official/inference/kernel.py:_csa_compress_regions_kernel, one (region, head) program

@@ -1457,7 +1457,7 @@ static void * ggml_cuda_host_malloc(size_t size) {
 
     // Whether to request the kernel to attempt to defragment memory to back the region with 2M hugepages.
     // Otherwise dependent on kernel settings:
-    //   * enabled="always":  Hand over whatever 2M pages it has on hand and the rest will be 4k 
+    //   * enabled="always":  Hand over whatever 2M pages it has on hand and the rest will be 4k
     //   * enabled="madvise": 4k pages
     //   * enabled="never":   4k pages
     // Potluck on performance. If there's not much defragmentation to do, then you win. Otherwise come back in an hour.
@@ -4624,10 +4624,10 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
 
         // C12: the indexer_pack -> gather_sparse_attn pair is unordered under stream
         // capture (gather reads pre-pack arena contents at decode); run these eagerly.
-        if (node->op == GGML_OP_INDEXER_PACK || node->op == GGML_OP_GATHER_SPARSE_ATTN) {
-            use_cuda_graph = false;
-            break;
-        }
+        // if (node->op == GGML_OP_INDEXER_PACK || node->op == GGML_OP_GATHER_SPARSE_ATTN) {
+        //     use_cuda_graph = false;
+        //     break;
+        // }
 
         if (node->op == GGML_OP_MUL_MAT_ID && (node->ne[2] != 1 || node->src[2]->ne[0] != 1)) {
             use_cuda_graph = false; // This node type is not supported by CUDA graph capture

@@ -326,7 +326,9 @@ ggml_tensor * llm_build_context::build_step5_indexer_score(ggml_cgraph * gf, int
         cb(block_k, "step5_indexer_block_k_e4m3", il);
 
         if (fused_try) {
-            ggml_tensor * mseed = ggml_view_2d(ctx0, KQ_mask, n_kv, n_tokens, KQ_mask->nb[1], 0);
+            // Must use mask_f32 (F32), NOT KQ_mask (F16 under -fa 1), otherwise
+            // adding band_neg (-BIG) overflows F16 to -INF and poisons own-region cells!
+            ggml_tensor * mseed = mask_f32;
             if (band_neg) {
                 mseed = ggml_add(ctx0, mseed, ggml_view_2d(ctx0, band_neg, n_kv, n_tokens, band_neg->nb[1], 0));
             }
@@ -341,15 +343,18 @@ ggml_tensor * llm_build_context::build_step5_indexer_score(ggml_cgraph * gf, int
             if (supports_op(topk)) {
                 cb(topk, "step5_indexer_topk", il);
                 ggml_build_forward_expand(gf, topk);
-                // decode gather path: pack kept cell ids into per-row gather lists; the
-                // attention consumer reads only those rows (decode only; prefill stays
-                // masked-dense). Gated pending the pack->gather IMA fix.
+
                 const bool gather_try = getenv("IK_STEP5_GATHER") != nullptr;
-                if (gather_try && packed_out && n_tokens <= 8 && cparams.flash_attn) {
-                    // band01 is {n_kv, n_pad}; pack wants the seed's exact {n_kv, n_tokens}
-                    // (padded columns are band 0 by construction).
+                // Gate on the KV cache types BEFORE building pack: if the gather consumer
+                // can't run, the pack node must not exist (the plain-mask fallback would
+                // silently attend densely instead of sparsely).
+                const bool kv_ok = il < (int64_t) lctx.kv_self.k_l.size() && lctx.kv_self.k_l[il] &&
+                        lctx.kv_self.v_l[il] &&
+                        ggml_gsa_kv_supported(lctx.kv_self.k_l[il]->type, lctx.kv_self.v_l[il]->type);
+                if (gather_try && kv_ok && packed_out && n_tokens <= 8 && cparams.flash_attn) {
                     ggml_tensor * band_v = ggml_view_2d(ctx0, band01, n_kv, n_tokens, band01->nb[1], 0);
-                    ggml_tensor * pack = ggml_indexer_pack(ctx0, topk, mseed, band_v, (int) B);
+                    // Pass mask_f32 as seed (exact causal visibility in F32)
+                    ggml_tensor * pack = ggml_indexer_pack(ctx0, topk, mask_f32, band_v, (int) B);
                     if (supports_op(pack)) {
                         cb(pack, "step5_indexer_pack", il);
                         ggml_build_forward_expand(gf, pack);
@@ -357,9 +362,7 @@ ggml_tensor * llm_build_context::build_step5_indexer_score(ggml_cgraph * gf, int
                         return nullptr;
                     }
                 }
-                // dup of KQ_mask: F16 {n_kv, padded n_tok} on -fa 1 (FA-ready, no adapter),
-                // F32 {n_kv, n_tok} additive on -fa 0. pen = 0 -> hard -INF cliff.
-                ggml_tensor * fm = ggml_indexer_mask_own(ctx0, KQ_mask, topk, band01, 0.0f);
+                ggml_tensor * fm = ggml_indexer_mask_own(ctx0, KQ_mask, topk, band01);
                 cb(fm, "step5_fused_mask", il);
                 ggml_build_forward_expand(gf, fm);
                 *fused_mask_out = fm;
@@ -466,8 +469,7 @@ ggml_cgraph * llm_build_context::build_step5() {
         band01 = ggml_mul(ctx0, vis, ggml_reshape_2d(ctx0,
             ggml_cont(ctx0, ggml_permute(ctx0, lastb_rep, 1, 0, 2, 3)), n_kv_b, n_pad_b));
         cb(band01, "step5_own_region_band", -1);
-        band_neg = ggml_scale(ctx0, band01, -1e30f);
-        if (KQ_mask->type != GGML_TYPE_F32) band_neg = ggml_cast(ctx0, band_neg, KQ_mask->type);
+        band_neg = ggml_scale(ctx0, band01, -1e30f); // F32: -1e30 is the finite -BIG; an F16 cast would overflow it to -INF
         cb(band01, "step5_own_region_band", -1);
     }
 
