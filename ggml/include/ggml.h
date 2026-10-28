@@ -722,6 +722,8 @@ extern "C" {
         GGML_OP_FUSED_RMS_RMS_ADD,
         GGML_OP_BLEND,
         GGML_OP_INDEXER_TOPK,
+        GGML_OP_INDEXER_PACK,
+        GGML_OP_GATHER_SPARSE_ATTN,
         GGML_OP_MASK_TOPK,
         GGML_OP_SINKHORN,
         GGML_OP_HC_PRE,
@@ -2721,9 +2723,39 @@ extern "C" {
             enum ggml_unary_op    op,
             int                   n_top_k);
 
-    // Step-5 CSA region compress: softmax(z)-weighted mean of the proxy keys over each
-    // region's tokens (the softmax/sum axis is the region's tokens only; never across
-    // heads/regions/dims).
+    // Step-5 sparse gather: pack the fused indexer top-k cell ids into per-row gather
+    // lists (slot = cell id | visible-bit<<24), then run attention against the gathered
+    // K/V rows instead of a mask-gated dense pass.
+    //   topk : [kept, n_tokens] I32 cell ids from ggml_indexer_topk (descending score)
+    //   seed : {n_kv, n_tokens} F16/F32 dense causal mask view (+ own-region band); a
+    //          slot is visible iff the seed value at its cell is finite
+    //   band : [n_kv, n_tokens] F32 0/1 own-region force-append map (<= B cells per row;
+    //          a band cell already present in the topk list is dropped, not duplicated)
+    // Output: [kept + B, n_tokens] I32, packed = cell_id | (visible << 24); dead slots -1.
+    GGML_API struct ggml_tensor * ggml_indexer_pack(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * topk,
+            struct ggml_tensor  * seed,
+            struct ggml_tensor  * band01,
+            int                   n_band);
+
+    // Online-softmax attention over gathered K/V rows. q [d, n_tokens, n_head],
+    // k/v [d, n_kv, n_head_kv] (FA layout, k RoPE'd), packed [n_tokens, topk] I32
+    // (24-bit row id | 1<<24 valid), out [d, n_tokens, n_head] F32. Decode-only in the
+    // builder; the op itself is n_tokens-generic. CUDA-only.
+    GGML_API struct ggml_tensor * ggml_gather_sparse_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * packed,
+            float                 scale);
+
+    // Step-5 CSA region compress (fused): per-(region, dim) softmax(z)-weighted mean of the
+    // proxy keys over each region's tokens -- the official semantics of
+    // _official/inference/kernel.py:_csa_compress_regions_kernel, one (region, head) program
+    // there, one (region, dim) thread here (the softmax/sum axis is the region's tokens only;
+    // never across heads/regions/dims).
     //
     //   z        [head_size, n_kv]    (F16 or F32) per-dim softmax logits
     //   k        [head_size, n_kv]    F32 proxy keys

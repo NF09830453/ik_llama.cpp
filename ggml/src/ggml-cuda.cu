@@ -65,6 +65,7 @@
 #include "ggml-cuda/latent_attn.cuh"
 #include "ggml-cuda/blend.cuh"
 #include "ggml-cuda/indexer_topk.cuh"
+#include "ggml-cuda/indexer_pack.cuh"
 #include "ggml-cuda/csa_compress.cuh"
 #include "ggml-cuda/ds4_comp.cuh"
 
@@ -4377,6 +4378,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_INDEXER_TOPK:
             ggml_cuda_op_indexer_topk(ctx, dst);
             break;
+        case GGML_OP_INDEXER_PACK:
+            ggml_cuda_op_indexer_pack(ctx, dst);
+            break;
+        case GGML_OP_GATHER_SPARSE_ATTN:
+            ggml_cuda_op_gather_sparse_attn(ctx, dst);
+            break;
         case GGML_OP_CSA_COMPRESS:
             ggml_cuda_op_csa_compress(ctx, dst);
             break;
@@ -4611,6 +4618,13 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
         if (ggml_is_noop(node)) continue;
 
         if (node->op == GGML_OP_REDUCE) {
+            use_cuda_graph = false;
+            break;
+        }
+
+        // C12: the indexer_pack -> gather_sparse_attn pair is unordered under stream
+        // capture (gather reads pre-pack arena contents at decode); run these eagerly.
+        if (node->op == GGML_OP_INDEXER_PACK || node->op == GGML_OP_GATHER_SPARSE_ATTN) {
             use_cuda_graph = false;
             break;
         }
@@ -5295,6 +5309,12 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                    op->src[3]->ne[0] == op->src[0]->ne[2];
         case GGML_OP_DELTA_NET:
         case GGML_OP_INDEXER_TOPK:
+        case GGML_OP_INDEXER_PACK:
+            return true;
+        case GGML_OP_GATHER_SPARSE_ATTN:
+            // only the K/V combos the kernel instantiates (else the builder falls
+            // back to the fused mask instead of aborting at launch)
+            return ggml_gsa_kv_supported(op->src[1]->type, op->src[2]->type);
         case GGML_OP_CSA_COMPRESS:
         case GGML_OP_MASK_TOPK:
         case GGML_OP_MASK_TO_IDX:

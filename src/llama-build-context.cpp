@@ -2239,7 +2239,7 @@ static ggml_tensor * llm_build_kqv(
                     int       il,
                 ggml_tensor * sinks = nullptr, int n_swa = 0, int kv_il = -1,
                 ggml_tensor ** k_cache_view = nullptr, ggml_tensor ** v_cache_view = nullptr,
-                    int32_t kv_view_offset = 0) {
+                    int32_t kv_view_offset = 0, ggml_tensor * sparse_pack = nullptr) {
     const llama_model   & model   = lctx.model;
     const llama_hparams & hparams = lctx.model.hparams;
     const llama_cparams & cparams = lctx.cparams;
@@ -2321,12 +2321,32 @@ static ggml_tensor * llm_build_kqv(
             cb(v, "v", il);
         }
 
+        if (sparse_pack) {
+            GGML_ASSERT(!sinks && n_swa == 0);
+            // kernel-supported K/V combos only (must mirror ggml_gsa_kv_supported in
+            // ggml-cuda/indexer_pack.cuh); anything else falls back to the fused mask
+            // (packed subgraph becomes dead weight in the graph but is never launched)
+            const auto gsa_kv_ok = [](ggml_type t) {
+                return t == GGML_TYPE_F16 || t == GGML_TYPE_F32 || t == GGML_TYPE_Q8_0 ||
+                       t == GGML_TYPE_Q6_0 || t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q5_1 ||
+                       t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1;
+            };
+            const bool kv_ok = gsa_kv_ok(k->type) && gsa_kv_ok(v->type);
+            if (kv_ok) {
+                cur = ggml_gather_sparse_attn(ctx, q, k, v, sparse_pack, kq_scale);
+                cb(cur, "fa_gather", il);
+            } else {
+                sparse_pack = nullptr;
+            }
+        }
+        if (!sparse_pack) {
         cur = ggml_flash_attn_ext(ctx, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                 hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         cb(cur, "fa", il);
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         if (n_swa > 0 && !kv.cells_disordered && cparams.n_seq_max == 1) {
             ((int32_t *)cur->op_params)[4] = n_swa;
+        }
         }
 
         // Some models produced NaNs/gibberish when FA is computed with f16 precision on CUDA
@@ -2503,7 +2523,7 @@ ggml_tensor * llm_build_context::llm_build_kv(
                     float     kq_scale,
          const llm_build_cb & cb, int il, ggml_tensor * sinks, int n_swa, int kv_il,
          ggml_tensor ** k_cache_view, ggml_tensor ** v_cache_view,
-                    int32_t   swa_head) {
+                    int32_t   swa_head, ggml_tensor * sparse_pack) {
     const llama_hparams & hparams = lctx.model.hparams;
     const llama_cparams & cparams = lctx.cparams;
 
@@ -2544,7 +2564,7 @@ ggml_tensor * llm_build_context::llm_build_kv(
     }
 
     auto cur = llm_build_kqv(ctx, lctx, kv, graph, wo, wo_b, q_cur, kq_mask, n_tokens, n_kv_view, kq_scale, cb, il, sinks, n_swa, kv_il,
-            k_cache_view, v_cache_view, kv_view_offset);
+            k_cache_view, v_cache_view, kv_view_offset, sparse_pack);
     cb(cur, "kqv_out", il);
 
     return cur;
@@ -3360,7 +3380,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
         ggml_tensor * KQ_mask, ggml_tensor * sinks, ggml_tensor * inp_attn_scale, float KQ_scale, float f_attn_scale,
         int n_swa, int il, bool do_rope, bool add_graph_split, bool add_input, bool is_norm, bool is_multi,
         ggml_tensor * post_norm, int kv_il, float post_norm_eps, post_norm_data * pnd,
-        ggml_tensor ** k_view, ggml_tensor ** v_view) {
+        ggml_tensor ** k_view, ggml_tensor ** v_view, ggml_tensor * sparse_pack) {
 
     float freq_base_l  = n_swa > 0 ? hparams.rope_freq_base_train_swa : cparams.rope_freq_base;
     float freq_scale_l = n_swa > 0 ? hparams.rope_freq_scale_train_swa : hparams.rope_freq_scale_train;
@@ -3770,7 +3790,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
         cur = llm_build_kv(ctx0, lctx, kv_self, gf,
                 nullptr, nullptr,
                 Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, KQ_scale, cb, il, sinks, n_swa, kv_il,
-                k_view, v_view, swa_head);
+                k_view, v_view, swa_head, sparse_pack);
         cb(cur, "wqkv", il);
         auto gate = llm_build_lora_mm(lctx, ctx0, wqkv_gate, input_normed);
         if (model.arch == LLM_ARCH_LAGUNA) {
@@ -3812,7 +3832,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
         if (gate) {
             cur = llm_build_kv(ctx0, lctx, kv_self, gf, nullptr, nullptr,
                     Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, KQ_scale, cb, il, sinks, n_swa, kv_il,
-                    k_view, v_view, swa_head);
+                    k_view, v_view, swa_head, sparse_pack);
             if (false && cur->ne[1] == 1) { // we need to add GGML_UNARY_OP_SIGMOID to the ops supported by ggml_fused_mul_unary
                 cur = ggml_fused_mul_unary(ctx0, cur, gate, GGML_UNARY_OP_SIGMOID);
             } else {
@@ -3830,7 +3850,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
             cur = llm_build_kv(ctx0, lctx, kv_self, gf,
                     model.layers[il].wo, model.layers[il].bo,
                     Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, KQ_scale, cb, il, sinks, n_swa, kv_il,
-                    k_view, v_view, swa_head);
+                    k_view, v_view, swa_head, sparse_pack);
         }
     }
 

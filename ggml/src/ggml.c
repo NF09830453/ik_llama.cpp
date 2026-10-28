@@ -4708,6 +4708,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FUSED_RMS_RMS_ADD",
     "BLEND",
     "INDEXER_TOPK",
+    "INDEXER_PACK",
+    "GATHER_SPARSE_ATTN",
     "MASK_TOPK",
     "SINKHORN",
     "HC_PRE",
@@ -4718,7 +4720,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CSA_COMPRESS",
 };
 
-static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
+static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 114");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -4846,10 +4848,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "latent_attn_prefix(q,c,pk,pv,mask)",
     "ds4_comp(state, score, idx)",
     "csa_compress(z,k,vis)",
+    "indexer_pack(topk,seed,band)",
+    "gather_sparse_attn(q,k,v,packed)",
 
 };
 
-static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
+static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 114");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -10714,6 +10718,63 @@ struct ggml_tensor * ggml_csa_compress(
     return result;
 }
 
+// topk [kept, n_tokens] I32 cell ids (fused topk output, descending score); seed
+// {n_kv, n_tokens} = dense causal mask (+ own-region exclusion band): a slot is visible iff
+// its seed value is finite. band {n_kv, n_tokens} F32: 1.0 on the own-region causal cells --
+// appended after the topk slots (the reference's topk+1 region). Packed slot =
+// cell_id | (visible << 24); dead slots = -1.
+// topk [kept, n_tokens] I32 cell ids (fused topk output, descending score); seed
+// {n_kv, n_tokens} mask view (dense causal [+ own-region -BIG band]); band {n_kv, n_tokens}
+// F32 0/1 own-region force-append map. Output [kept + n_band, n_tokens] I32:
+// slot = cell_id | (visible << 24), dead slots = -1 (invisible/garbage ids get valid=0;
+// the attention kernel skips them). Cell-grain: no block collapse -- the kept set already
+// snaps to whole blocks, and per-cell lists make visibility exact under any cache state.
+struct ggml_tensor * ggml_indexer_pack(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * topk,
+        struct ggml_tensor  * seed,
+        struct ggml_tensor  * band,
+        int                   n_band) {
+    GGML_ASSERT(topk->type == GGML_TYPE_I32 && topk->ne[2] == 1 && topk->ne[3] == 1);
+    GGML_ASSERT(seed->ne[1] == topk->ne[1]);
+    GGML_ASSERT(band->type == GGML_TYPE_F32 && band->ne[0] == seed->ne[0] && band->ne[1] == seed->ne[1]);
+    GGML_ASSERT(n_band > 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, topk->ne[0] + n_band, topk->ne[1]);
+    result->op = GGML_OP_INDEXER_PACK;
+    result->src[0] = topk;
+    result->src[1] = seed;
+    result->src[2] = band;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_gather_sparse_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * packed,
+        float                 scale) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[1] == packed->ne[1]);
+    GGML_ASSERT(k->ne[0] == q->ne[0] && k->ne[1] == v->ne[1] && k->ne[2] == v->ne[2]);
+    GGML_ASSERT(q->ne[2] % k->ne[2] == 0);
+    GGML_ASSERT(packed->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(packed)); // k/v may be cache views (any strides; the kernel is stride-based)
+
+    // FA-compatible result layout: ne {D, H, T} (heads dim1, tokens dim2) -- the builder
+    // reshapes this like the FA path's output; kernel writes (t,h) at (t*H+h)*d + i.
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, q->ne[0], q->ne[2], q->ne[1]);
+    result->op = GGML_OP_GATHER_SPARSE_ATTN;
+    memcpy(result->op_params, &scale, sizeof(scale));
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = packed;
+
+    return result;
+}
 
 struct ggml_tensor * ggml_sinkhorn(
             struct ggml_context * ctx,
@@ -27638,6 +27699,11 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
             {
                 ggml_compute_forward_csa_compress(params, tensor);
             } break;
+        case GGML_OP_INDEXER_PACK:
+        case GGML_OP_GATHER_SPARSE_ATTN:
+            {
+                GGML_ABORT("fatal error: CUDA-only op on CPU");
+            } break;
         case GGML_OP_LATENT_ATTN:
             {
                 ggml_compute_forward_latent_attn(params, tensor);
@@ -28722,6 +28788,8 @@ static void ggml_compute_backward(struct ggml_context * ctx, struct ggml_tensor 
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_DELTA_NET:
         case GGML_OP_INDEXER_TOPK:
+        case GGML_OP_INDEXER_PACK:
+        case GGML_OP_GATHER_SPARSE_ATTN:
         case GGML_OP_MASK_TOPK:
         case GGML_OP_SINKHORN:
         case GGML_OP_HC_PRE:
@@ -29510,6 +29578,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_DELTA_NET:
         case GGML_OP_INDEXER_TOPK:
+        case GGML_OP_INDEXER_PACK:
+        case GGML_OP_GATHER_SPARSE_ATTN:
         case GGML_OP_MASK_TOPK:
         case GGML_OP_SINKHORN:
         case GGML_OP_HC_PRE:
@@ -29858,6 +29928,11 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                     cur = iqk_idx_topk_work_buffer_size(node, n_tasks);
                 } break;
             case GGML_OP_CSA_COMPRESS:
+                {
+                    cur = 0;
+                } break;
+            case GGML_OP_INDEXER_PACK:
+            case GGML_OP_GATHER_SPARSE_ATTN:
                 {
                     cur = 0;
                 } break;

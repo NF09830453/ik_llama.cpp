@@ -97,7 +97,8 @@ void llm_build_context::build_step5_indexer_kv_write(ggml_cgraph * gf, int il, g
 
 ggml_tensor * llm_build_context::build_step5_indexer_score(ggml_cgraph * gf, int il,
         ggml_tensor * inpL, ggml_tensor * inp_pos, ggml_tensor * KQ_mask,
-        ggml_tensor * band01, ggml_tensor * band_neg, ggml_tensor ** fused_mask_out) {
+        ggml_tensor * band01, ggml_tensor * band_neg, ggml_tensor ** fused_mask_out,
+        ggml_tensor ** packed_out) {
     const int64_t head_size = hparams.indexer_head_size; // proxy_dim (HF sparse_config: 256)
     const int64_t n_ihead   = hparams.indexer_n_head;    // proxy q heads (HF num_heads: 16)
 
@@ -340,7 +341,25 @@ ggml_tensor * llm_build_context::build_step5_indexer_score(ggml_cgraph * gf, int
             if (supports_op(topk)) {
                 cb(topk, "step5_indexer_topk", il);
                 ggml_build_forward_expand(gf, topk);
-                ggml_tensor * fm = ggml_indexer_mask_own(ctx0, KQ_mask, topk, band01);
+                // decode gather path: pack kept cell ids into per-row gather lists; the
+                // attention consumer reads only those rows (decode only; prefill stays
+                // masked-dense). Gated pending the pack->gather IMA fix.
+                const bool gather_try = getenv("IK_STEP5_GATHER") != nullptr;
+                if (gather_try && packed_out && n_tokens <= 8 && cparams.flash_attn) {
+                    // band01 is {n_kv, n_pad}; pack wants the seed's exact {n_kv, n_tokens}
+                    // (padded columns are band 0 by construction).
+                    ggml_tensor * band_v = ggml_view_2d(ctx0, band01, n_kv, n_tokens, band01->nb[1], 0);
+                    ggml_tensor * pack = ggml_indexer_pack(ctx0, topk, mseed, band_v, (int) B);
+                    if (supports_op(pack)) {
+                        cb(pack, "step5_indexer_pack", il);
+                        ggml_build_forward_expand(gf, pack);
+                        *packed_out = pack;
+                        return nullptr;
+                    }
+                }
+                // dup of KQ_mask: F16 {n_kv, padded n_tok} on -fa 1 (FA-ready, no adapter),
+                // F32 {n_kv, n_tok} additive on -fa 0. pen = 0 -> hard -INF cliff.
+                ggml_tensor * fm = ggml_indexer_mask_own(ctx0, KQ_mask, topk, band01, 0.0f);
                 cb(fm, "step5_fused_mask", il);
                 ggml_build_forward_expand(gf, fm);
                 *fused_mask_out = fm;
@@ -471,7 +490,8 @@ ggml_cgraph * llm_build_context::build_step5() {
         layer.rope_freqs = nullptr;
         build_step5_indexer_kv_write(gf, il, inpL);
         ggml_tensor * fused_mask = nullptr;
-        ggml_tensor * idx_score = build_step5_indexer_score(gf, il, inpL, inp_pos, KQ_mask, band01, band_neg, &fused_mask);
+        ggml_tensor * packed = nullptr;
+        ggml_tensor * idx_score = build_step5_indexer_score(gf, il, inpL, inp_pos, KQ_mask, band01, band_neg, &fused_mask, &packed);
 
         // Selection: fused in-kernel topk+mask when available, else decomposed argsort + scatter.
         ggml_tensor * attn_mask = is_swa ? KQ_mask_swa : KQ_mask;
@@ -506,7 +526,7 @@ ggml_cgraph * llm_build_context::build_step5() {
         cur = build_std_attention(gf, model.layers[il].attn_norm, inpL,
                 inp_pos, il == n_layer_base - 1 && n_tokens > 1 && !cparams.mtp ? inp_out_ids : nullptr,
                 rope_factors, attn_mask, nullptr, nullptr, kq_scale, 0.0f, is_swa ? hparams.n_swa : 0,
-                il, true, false, true);
+                il, true, false, true, false, false, nullptr, -1, 0.0f, nullptr, nullptr, nullptr, packed);
         layer.rope_freqs = rope_freqs;
 
         if (model.layers[il].ffn_gate_inp == nullptr) {
