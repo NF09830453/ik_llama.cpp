@@ -12,10 +12,9 @@ template <typename seed_t>
 static __global__ void k_indexer_pack(
         const int  * __restrict__ topk,
         const char * __restrict__ seed,
-        const char * __restrict__ band,
         int        * __restrict__ dst,
-        int n_kv, int kept, int total,
-        size_t nb_topk1, size_t nb_seed1, size_t nb_band1, size_t nb_dst1) {
+        int n_kv, int kept, int total, int B, int n_tok,
+        size_t nb_topk1, size_t nb_seed1, size_t nb_dst1) {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
     const int nth = blockDim.x;
@@ -23,6 +22,7 @@ static __global__ void k_indexer_pack(
     extern __shared__ uint32_t s_mem[];
     uint32_t * seen = s_mem; // [n_words]
     __shared__ int s_count;
+    __shared__ int s_scan[256];
 
     const int n_words = (n_kv + 31) >> 5;
     for (int w = tid; w < n_words; w += nth) {
@@ -35,10 +35,9 @@ static __global__ void k_indexer_pack(
 
     const int    * topk_row = (const int    *)((const char *)topk + (size_t)row * nb_topk1);
     const seed_t * seed_row = (const seed_t *)(seed + (size_t)row * nb_seed1);
-    const float  * band_row = (const float  *)(band + (size_t)row * nb_band1);
     int          * dst_row  = (int          *)((char *)dst + (size_t)row * nb_dst1);
 
-    // 1. Mark all causally-visible topk cells in the bitmask (automatically deduplicates!)
+    // 1. Mark all causally-visible topk cells in the bitmask
     for (int j = tid; j < kept; j += nth) {
         const int id = topk_row[j];
         if (id >= 0 && id < n_kv && !isinf((float)seed_row[id])) {
@@ -46,25 +45,30 @@ static __global__ void k_indexer_pack(
         }
     }
 
-    // 2. Cooperatively scan band_row in parallel and mark all causally-visible band cells
-    for (int c = tid; c < n_kv; c += nth) {
-        if (band_row[c] > 0.5f && !isinf((float)seed_row[c])) {
+    // 2. Force-append the query's own (partial) block: derive it arithmetically
+    //    from n_kv/n_tok (q_pos = n_kv - n_tok + row) so no band tensor is needed.
+    //    Own block = [own0, q_pos], at most B cells.
+    const int q_pos = n_kv - n_tok + row;
+    const int own0  = (q_pos / B) * B;
+    for (int c = own0 + tid; c <= q_pos; c += nth) {
+        if (!isinf((float)seed_row[c])) {
             atomicOr(&seen[c >> 5], 1u << (c & 31));
         }
     }
     __syncthreads();
 
-    // 3. Compact set bits into dst_row[0 .. valid_count - 1], globally ascending cell order
-    //    (physical-major). Per-thread word popcounts + exclusive block scan give each thread
-    //    a deterministic slot base -- no atomicAdd ordering, output is run-to-run stable.
-    //    Thread tid owns words tid, tid+nth, tid+2*nth, ... so word ranges stay ascending.
+    // 3. Contiguous word range [w_start, w_end) per thread -> true globally ascending cell order!
+    const int words_per_thread = (n_words + nth - 1) / nth;
+    const int w_start = min(tid * words_per_thread, n_words);
+    const int w_end   = min(w_start + words_per_thread, n_words);
+
     int cnt = 0;
-    for (int w = tid; w < n_words; w += nth) {
+    for (int w = w_start; w < w_end; ++w) {
         cnt += __popc(seen[w]);
     }
-    __shared__ int s_scan[256]; // host launches k_block = 256
     s_scan[tid] = cnt;
     __syncthreads();
+
     if (tid == 0) {
         int acc = 0;
         for (int i = 0; i < nth; ++i) {
@@ -72,10 +76,16 @@ static __global__ void k_indexer_pack(
             s_scan[i] = acc;
             acc += v;
         }
+        s_count = acc;
+        if (acc > total) {
+            printf("BUG in k_indexer_pack: s_count=%d > total=%d (kept=%d, n_kv=%d)!\n",
+                   acc, total, kept, n_kv);
+        }
     }
     __syncthreads();
+
     int out_idx = s_scan[tid];
-    for (int w = tid; w < n_words; w += nth) {
+    for (int w = w_start; w < w_end; ++w) {
         uint32_t mask = seen[w];
         while (mask) {
             const int bit = __ffs(mask) - 1;
@@ -86,10 +96,6 @@ static __global__ void k_indexer_pack(
             ++out_idx;
         }
     }
-    if (tid == nth - 1) {
-        s_count = s_scan[tid] + cnt; // total valid cells
-    }
-    __syncthreads();
 
     // 4. Fill remaining dead slots with -1
     const int valid_count = s_count;
@@ -99,9 +105,9 @@ static __global__ void k_indexer_pack(
 }
 
 void ggml_cuda_op_indexer_pack(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    int64_t _t0 = ggml_time_us();
     const ggml_tensor * topk = dst->src[0];
     const ggml_tensor * seed = dst->src[1];
-    const ggml_tensor * band = dst->src[2];
 
     const int n_kv  = (int)seed->ne[0];
     const int kept  = (int)topk->ne[0];
@@ -114,16 +120,21 @@ void ggml_cuda_op_indexer_pack(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const size_t smem = (size_t)n_words * sizeof(uint32_t);
     dim3 grid(n_tok, 1, 1);
 
+    // force-append budget = own partial block (<= B); total = kept + B by construction
+    const int B = total - kept;
+    GGML_ASSERT(B > 0);
+
     if (seed->type == GGML_TYPE_F16) {
         k_indexer_pack<half><<<grid, k_block, smem, ctx.stream()>>>(
-            (const int *)topk->data, (const char *)seed->data, (const char *)band->data,
-            (int *)dst->data, n_kv, kept, total,
-            topk->nb[1], seed->nb[1], band->nb[1], dst->nb[1]);
+            (const int *)topk->data, (const char *)seed->data,
+            (int *)dst->data, n_kv, kept, total, B, n_tok,
+            topk->nb[1], seed->nb[1], dst->nb[1]);
     } else {
         k_indexer_pack<float><<<grid, k_block, smem, ctx.stream()>>>(
-            (const int *)topk->data, (const char *)seed->data, (const char *)band->data,
-            (int *)dst->data, n_kv, kept, total,
-            topk->nb[1], seed->nb[1], band->nb[1], dst->nb[1]);
+            (const int *)topk->data, (const char *)seed->data,
+            (int *)dst->data, n_kv, kept, total, B, n_tok,
+            topk->nb[1], seed->nb[1], dst->nb[1]);
     }
     CUDA_CHECK(cudaGetLastError());
+    gsa_time_log("indexer_pack", _t0, n_kv);
 }

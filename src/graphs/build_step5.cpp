@@ -1,5 +1,7 @@
 #include "../llama-build-context.h"
 #include "../llama-model.h"
+#include "../llama-impl.h"
+#include <mutex>
 #include "../llama-context.h"
 
 // Step-5 sparse GQA indexer: proxy-key cache write + read-back scoring graph.
@@ -23,6 +25,16 @@ static bool ik_sparse_enabled() {
 
 bool llama_step5_csa_z_cache() {
     return true;
+}
+
+// Indexer build-path decision log: prints when the taken branch CHANGES (warmup vs decode).
+static void log_idx_path(int decision, int il, int64_t n_tokens, int64_t n_kv, bool cb_eval) {
+    static int prev = -1;
+    if (decision == prev) return;
+    prev = decision;
+    LLAMA_LOG_INFO("%s: indexer path = %s (il=%d n_tok=%lld n_kv=%lld cb_eval=%d)\n", __func__,
+            decision == 1 ? "PACK+GATHER" : decision == 2 ? "FUSED_MASK" : "DECOMPOSED",
+            il, (long long) n_tokens, (long long) n_kv, (int) cb_eval);
 }
 
 static int64_t ik_kept_slots(const llama_hparams & hparams, int64_t n_kv_sel) {
@@ -352,16 +364,17 @@ ggml_tensor * llm_build_context::build_step5_indexer_score(ggml_cgraph * gf, int
                         lctx.kv_self.v_l[il] &&
                         ggml_gsa_kv_supported(lctx.kv_self.k_l[il]->type, lctx.kv_self.v_l[il]->type);
                 if (gather_try && kv_ok && packed_out && n_tokens <= 8 && cparams.flash_attn) {
-                    ggml_tensor * band_v = ggml_view_2d(ctx0, band01, n_kv, n_tokens, band01->nb[1], 0);
-                    // Pass mask_f32 as seed (exact causal visibility in F32)
-                    ggml_tensor * pack = ggml_indexer_pack(ctx0, topk, mask_f32, band_v, (int) B);
+                    // Force-append = own (partial) block, derived in-kernel from n_kv.
+                    ggml_tensor * pack = ggml_indexer_pack(ctx0, topk, mask_f32, (int) B);
                     if (supports_op(pack)) {
+                        log_idx_path(1, il, n_tokens, n_kv, lctx.cparams.cb_eval);
                         cb(pack, "step5_indexer_pack", il);
                         ggml_build_forward_expand(gf, pack);
                         *packed_out = pack;
                         return nullptr;
                     }
                 }
+                log_idx_path(2, il, n_tokens, n_kv, lctx.cparams.cb_eval);
                 ggml_tensor * fm = ggml_indexer_mask_own(ctx0, KQ_mask, topk, band01);
                 cb(fm, "step5_fused_mask", il);
                 ggml_build_forward_expand(gf, fm);
@@ -382,6 +395,7 @@ ggml_tensor * llm_build_context::build_step5_indexer_score(ggml_cgraph * gf, int
 
     ggml_tensor * indexer_score = ggml_add(ctx0, mask_f32, slot_score);
     cb(indexer_score, "step5_indexer_score", il);
+    log_idx_path(3, il, n_tokens, n_kv, lctx.cparams.cb_eval);
     if (lctx.cparams.cb_eval) {
         ggml_build_forward_expand(gf, indexer_score);
     }
@@ -390,6 +404,12 @@ ggml_tensor * llm_build_context::build_step5_indexer_score(ggml_cgraph * gf, int
 
 ggml_cgraph * llm_build_context::build_step5() {
     ggml_cgraph * gf = new_graph_custom();
+    static bool logged_path = false;
+    if (!logged_path) {
+        logged_path = true;
+        LLAMA_LOG_INFO("%s: step5 sparse path = %s\n", __func__,
+                getenv("IK_STEP5_GATHER") ? "GATHER (IK_STEP5_GATHER=1)" : "MASKED (set IK_STEP5_GATHER=1 for gather decode)");
+    }
     ggml_tensor * cur;
     auto inp_pos     = build_inp_pos();
 

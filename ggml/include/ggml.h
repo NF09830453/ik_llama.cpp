@@ -2729,14 +2729,14 @@ extern "C" {
     //   topk : [kept, n_tokens] I32 cell ids from ggml_indexer_topk (descending score)
     //   seed : {n_kv, n_tokens} F16/F32 dense causal mask view (+ own-region band); a
     //          slot is visible iff the seed value at its cell is finite
-    //   band : [n_kv, n_tokens] F32 0/1 own-region force-append map (<= B cells per row;
-    //          a band cell already present in the topk list is dropped, not duplicated)
+    // Force-append: the query's own (partial) block is derived arithmetically from
+    // n_kv and n_band (= B), so no band tensor is needed; cells already present in
+    // the topk list are dropped, not duplicated.
     // Output: [kept + B, n_tokens] I32, packed = cell_id | (visible << 24); dead slots -1.
     GGML_API struct ggml_tensor * ggml_indexer_pack(
             struct ggml_context * ctx,
             struct ggml_tensor  * topk,
             struct ggml_tensor  * seed,
-            struct ggml_tensor  * band01,
             int                   n_band);
 
     // Online-softmax attention over gathered K/V rows. q [d, n_tokens, n_head],

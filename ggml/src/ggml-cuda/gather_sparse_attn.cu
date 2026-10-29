@@ -190,6 +190,7 @@ static __global__ void k_gather_sparse_attn(
 }
 
 void ggml_cuda_op_gather_sparse_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    int64_t _t0 = ggml_time_us();
     const ggml_tensor * q      = dst->src[0];
     const ggml_tensor * k      = dst->src[1];
     const ggml_tensor * v      = dst->src[2];
@@ -218,4 +219,5 @@ void ggml_cuda_op_gather_sparse_attn(ggml_backend_cuda_context & ctx, ggml_tenso
         q->nb[1], q->nb[2], k->nb[1], k->nb[2], v->nb[1], v->nb[2],
         dst->nb[1], dst->nb[2]);
     CUDA_CHECK(cudaGetLastError());
+    gsa_time_log("gather_sparse_attn", _t0, (int)k->ne[1]);
 }

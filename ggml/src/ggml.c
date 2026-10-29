@@ -10725,26 +10725,24 @@ struct ggml_tensor * ggml_csa_compress(
 // cell_id | (visible << 24); dead slots = -1.
 // topk [kept, n_tokens] I32 cell ids (fused topk output, descending score); seed
 // {n_kv, n_tokens} mask view (dense causal [+ own-region -BIG band]); band {n_kv, n_tokens}
-// F32 0/1 own-region force-append map. Output [kept + n_band, n_tokens] I32:
-// slot = cell_id | (visible << 24), dead slots = -1 (invisible/garbage ids get valid=0;
-// the attention kernel skips them). Cell-grain: no block collapse -- the kept set already
-// snaps to whole blocks, and per-cell lists make visibility exact under any cache state.
+// Output [kept + B, n_tokens] I32: slot = cell_id | (visible << 24), dead slots = -1
+// (invisible/garbage ids get valid=0; the attention kernel skips them). The
+// force-append set is the query's own partial block, derived from n_kv and n_band,
+// so no band tensor is needed. Cell-grain: the kept set already snaps to whole
+// blocks, and per-cell lists make visibility exact under any cache state.
 struct ggml_tensor * ggml_indexer_pack(
         struct ggml_context * ctx,
         struct ggml_tensor  * topk,
         struct ggml_tensor  * seed,
-        struct ggml_tensor  * band,
         int                   n_band) {
     GGML_ASSERT(topk->type == GGML_TYPE_I32 && topk->ne[2] == 1 && topk->ne[3] == 1);
     GGML_ASSERT(seed->ne[1] == topk->ne[1]);
-    GGML_ASSERT(band->type == GGML_TYPE_F32 && band->ne[0] == seed->ne[0] && band->ne[1] == seed->ne[1]);
     GGML_ASSERT(n_band > 0);
 
     struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, topk->ne[0] + n_band, topk->ne[1]);
     result->op = GGML_OP_INDEXER_PACK;
     result->src[0] = topk;
     result->src[1] = seed;
-    result->src[2] = band;
 
     return result;
 }
