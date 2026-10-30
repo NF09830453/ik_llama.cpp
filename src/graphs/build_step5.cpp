@@ -140,7 +140,6 @@ ggml_tensor * llm_build_context::build_step5_indexer_score(ggml_cgraph * gf, int
 
     const int64_t rope_dim = std::min<int64_t>(
             hparams.indexer_rope_dim > 0 ? hparams.indexer_rope_dim : head_size, head_size);
-    const int64_t nope_dim = head_size - rope_dim;
 
     if (!lctx.inp_kv_pos) {
         lctx.inp_kv_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_kv);
@@ -159,31 +158,21 @@ ggml_tensor * llm_build_context::build_step5_indexer_score(ggml_cgraph * gf, int
     q_cur = step5_bf16_roundtrip(ctx0, q_cur); // torch norm materializes bf16 output
     cb(q_cur, "step5_indexer_q_normed", il);
 
-    ggml_tensor * q_pe = ggml_view_3d(ctx0, q_cur, rope_dim, n_ihead, n_tokens,
-            ggml_row_size(q_cur->type, head_size),
-            ggml_row_size(q_cur->type, head_size) * n_ihead, 0);
-    q_pe = ggml_rope_ext(ctx0, q_pe, inp_pos, nullptr, rope_dim,
+    // rope_ext rotates [0..rope_dim) and copies [rope_dim..head_size) in one pass:
+    // no pe/nope concat needed (works for both norm and neox rope).
+    q_cur = ggml_rope_ext(ctx0, q_cur, inp_pos, nullptr, rope_dim,
             rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
-    if (nope_dim > 0) {
-        ggml_tensor * q_nope = ggml_view_3d(ctx0, q_cur, nope_dim, n_ihead, n_tokens,
-                ggml_row_size(q_cur->type, head_size),
-                ggml_row_size(q_cur->type, head_size) * n_ihead,
-                ggml_row_size(q_cur->type, rope_dim));
-        q_cur = ggml_concat(ctx0, q_pe, q_nope, 0);
-    } else {
-        q_cur = q_pe;
-    }
     cb(q_cur, "step5_indexer_q_cat", il);
     q_cur = step5_bf16_roundtrip(ctx0, q_cur); // torch rope materializes bf16 output
     // Official e4m3 activation round on the indexer q.
     q_cur = ggml_round_e4m3(ctx0, q_cur);
     cb(q_cur, "step5_indexer_q_e4m3", il);
 
-    ggml_tensor * z_cur = ggml_mul_mat(ctx0, layer.indexer_z, inpL); // {head_size, n_tokens}
-    z_cur = step5_bf16_roundtrip(ctx0, z_cur); // torch linear materializes bf16 output
-    cb(z_cur, "step5_indexer_z_raw", il);
     if (lctx.cparams.cb_eval) {
+        ggml_tensor * z_cur = ggml_mul_mat(ctx0, layer.indexer_z, inpL); // {head_size, n_tokens}
+        z_cur = step5_bf16_roundtrip(ctx0, z_cur); // torch linear materializes bf16 output
+        cb(z_cur, "step5_indexer_z_raw", il);
         ggml_build_forward_expand(gf, z_cur);
     }
 
@@ -204,32 +193,35 @@ ggml_tensor * llm_build_context::build_step5_indexer_score(ggml_cgraph * gf, int
     }
     cb(k_f32, "step5_indexer_cached_k", il);
 
-    ggml_tensor * k_pe = ggml_view_3d(ctx0, k_f32, rope_dim, 1, n_kv,
+    // Single-pass rope over [0..rope_dim) + passthrough of [rope_dim..head_size).
+    ggml_tensor * k_full = ggml_view_3d(ctx0, k_f32, head_size, 1, n_kv,
             ggml_row_size(k_f32->type, head_size),
             ggml_row_size(k_f32->type, head_size), 0);
-    k_pe = ggml_rope_ext(ctx0, k_pe, lctx.inp_kv_pos, nullptr, rope_dim,
+    ggml_tensor * indexer_k_b = ggml_rope_ext(ctx0, k_full, lctx.inp_kv_pos, nullptr, rope_dim,
             rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
-    ggml_tensor * indexer_k_b;
-    if (nope_dim > 0) {
-        ggml_tensor * k_nope = ggml_view_3d(ctx0, k_f32, nope_dim, 1, n_kv,
-                ggml_row_size(k_f32->type, head_size),
-                ggml_row_size(k_f32->type, head_size),
-                ggml_row_size(k_f32->type, rope_dim));
-        indexer_k_b = ggml_concat(ctx0, k_pe, k_nope, 0);
-    } else {
-        indexer_k_b = k_pe;
-    }
     indexer_k_b = ggml_reshape_3d(ctx0, indexer_k_b, head_size, n_kv, 1);
     indexer_k_b = step5_bf16_roundtrip(ctx0, indexer_k_b); // torch rope materializes bf16 output
     cb(indexer_k_b, "step5_indexer_k_rope", il);
 
     // Scores: relu(q·k)·w summed over proxy heads at block grain, causal seed added last at slot granularity.
-    ggml_tensor * mask_f32 = ggml_view_2d(ctx0, KQ_mask, n_kv, n_tokens, KQ_mask->nb[1], 0);
-    if (mask_f32->type != GGML_TYPE_F32) {
-        mask_f32 = ggml_cast(ctx0, mask_f32, GGML_TYPE_F32);
-        cb(mask_f32, "step5_indexer_score_mask_f32", il);
+    // mask_f32 and vis are layer-invariant (same KQ_mask for every indexer layer): build once per graph.
+    if (step5_mask_key != KQ_mask) {
+        step5_mask_key = KQ_mask;
+        step5_mask_f32 = ggml_view_2d(ctx0, KQ_mask, n_kv, n_tokens, KQ_mask->nb[1], 0);
+        if (step5_mask_f32->type != GGML_TYPE_F32) {
+            step5_mask_f32 = ggml_cast(ctx0, step5_mask_f32, GGML_TYPE_F32);
+            cb(step5_mask_f32, "step5_indexer_score_mask_f32", il);
+        }
+        ggml_tensor * vis = ggml_step(ctx0, ggml_scale_bias(ctx0, step5_mask_f32, 1.0f, 0.5f));
+        vis = ggml_sum_rows_ext(ctx0, vis, 1);                       // {n_kv, 1}
+        vis = ggml_step(ctx0, ggml_scale_bias(ctx0, vis, 1.0f, -0.5f));
+        step5_vis = ggml_reshape_2d(ctx0, vis, n_kv, 1);
+        cb(step5_vis, "step5_indexer_slot_valid", il);
+        step5_band_key = nullptr;
+        step5_mseed = nullptr;
     }
+    ggml_tensor * mask_f32 = step5_mask_f32;
 
     // Per-indexer-head scoring on real ubatches (n_tokens > 8); fused shape capped at 8 tokens.
     auto score_chain = [&](ggml_tensor * keys, int64_t n_key) {
@@ -276,11 +268,7 @@ ggml_tensor * llm_build_context::build_step5_indexer_score(ggml_cgraph * gf, int
         GGML_ASSERT(B > 0 && n_kv % B == 0 && "CSA slot-aligned blocks need n_kv divisible by B");
         const int64_t n_blocks = n_kv / B;
 
-        ggml_tensor * vis = ggml_step(ctx0, ggml_scale_bias(ctx0, mask_f32, 1.0f, 0.5f));
-        vis = ggml_sum_rows_ext(ctx0, vis, 1);                       // {n_kv, 1}
-        vis = ggml_step(ctx0, ggml_scale_bias(ctx0, vis, 1.0f, -0.5f));
-        vis = ggml_reshape_2d(ctx0, vis, n_kv, 1);
-        cb(vis, "step5_indexer_slot_valid", il);
+        ggml_tensor * vis = step5_vis;
         ggml_tensor * block_k;
         {
             // Official per-dimension softmax(z)-weighted mean.
@@ -289,9 +277,9 @@ ggml_tensor * llm_build_context::build_step5_indexer_score(ggml_cgraph * gf, int
             if (kz_cache->type == GGML_TYPE_F16 || kz_cache->type == GGML_TYPE_F32) {
                 ggml_tensor * z_view = ggml_view_2d(ctx0, kz_cache, head_size, n_kv,
                         ggml_row_size(kz_cache->type, head_size), 0);
-                ggml_tensor * z_tap = ggml_cast(ctx0, ggml_cont(ctx0, z_view), GGML_TYPE_F32);
-                cb(z_tap, "step5_indexer_cached_z", il);
                 if (lctx.cparams.cb_eval) {
+                    ggml_tensor * z_tap = ggml_cast(ctx0, ggml_cont(ctx0, z_view), GGML_TYPE_F32);
+                    cb(z_tap, "step5_indexer_cached_z", il);
                     ggml_build_forward_expand(gf, z_tap);
                 }
                 block_k = ggml_csa_compress(ctx0, z_view, indexer_k_b, vis, (int) B, 1);
@@ -330,19 +318,27 @@ ggml_tensor * llm_build_context::build_step5_indexer_score(ggml_cgraph * gf, int
             ggml_tensor * num = ggml_sum_rows(ctx0, ggml_mul(ctx0, w, k_pv)); // {1, head, n_blocks}
             block_k = ggml_reshape_2d(ctx0, num, head_size, n_blocks);
             cb(block_k, "step5_indexer_block_k", il);
+            // The decomposed path does not round; the reference scores against the
+            // e4m3-rounded summary. The csa_compress path already rounds in-register
+            // (round_e4m3=1), so it must not be rounded a second time.
+            block_k = ggml_round_e4m3(ctx0, block_k);
+            cb(block_k, "step5_indexer_block_k_e4m3", il);
             }
         }
-
-        // The reference scores against the e4m3-rounded summary.
-        block_k = ggml_round_e4m3(ctx0, block_k);
-        cb(block_k, "step5_indexer_block_k_e4m3", il);
 
         if (fused_try) {
             // Must use mask_f32 (F32), NOT KQ_mask (F16 under -fa 1), otherwise
             // adding band_neg (-BIG) overflows F16 to -INF and poisons own-region cells!
             ggml_tensor * mseed = mask_f32;
             if (band_neg) {
-                mseed = ggml_add(ctx0, mseed, ggml_view_2d(ctx0, band_neg, n_kv, n_tokens, band_neg->nb[1], 0));
+                // mseed is layer-invariant (same band_neg for every indexer layer): build once per graph.
+                if (step5_band_key != band_neg) {
+                    step5_band_key = band_neg;
+                    step5_mseed = ggml_add(ctx0, mask_f32,
+                            ggml_view_2d(ctx0, band_neg, n_kv, n_tokens, band_neg->nb[1], 0));
+                    cb(step5_mseed, "step5_indexer_mseed", il);
+                }
+                mseed = step5_mseed;
             }
             if (!lctx.inp_step5_cell_blk) {
                 lctx.inp_step5_cell_blk = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_kv);

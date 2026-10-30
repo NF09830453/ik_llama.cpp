@@ -114,6 +114,14 @@ struct llm_build_context {
     struct ggml_tensor * last_sparse_mask     = nullptr;
     struct ggml_tensor * dsa_tg_fast_mask     = nullptr;
 
+    // Step-5 indexer score: layer-invariant tensors derived from KQ_mask / band_neg.
+    // Built once per graph build and shared across indexer layers (member defaults to null).
+    struct ggml_tensor * step5_mask_key = nullptr;
+    struct ggml_tensor * step5_mask_f32 = nullptr;
+    struct ggml_tensor * step5_vis      = nullptr;
+    struct ggml_tensor * step5_band_key = nullptr;
+    struct ggml_tensor * step5_mseed    = nullptr;
+
     // TODO: consider making the entire interface noexcept
     llm_build_context(
         llama_context  & lctx,
