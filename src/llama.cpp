@@ -1236,6 +1236,7 @@ static llama_pos llama_kv_openpangu_state_pos(const llama_kv_cache & cache, llam
 static constexpr uint32_t LLAMA_OPENPANGU_PARTIAL_LAYOUT_MAGIC = 0x50414732u; // "PAG2"
 static constexpr uint32_t LLAMA_OPENPANGU_PARTIAL_STATE_MAGIC  = 0x50414731u; // "PAG1"
 static constexpr uint32_t LLAMA_SWA_COMPACT_LAYOUT_MAGIC       = 0x53574143u; // "SWAC"
+static constexpr uint32_t LLAMA_STEP5_SUMMARY_STATE_MAGIC      = 0x53423553u; // "SB5S"
 
 static inline bool llama_kv_qnext_seq_id_in_range(const llama_kv_cache & cache, llama_seq_id seq_id) {
     const uint32_t n_slots = llama_kv_qnext_state_slots(cache);
@@ -1463,6 +1464,10 @@ static bool llama_kv_cache_init(
     if (has_step5_indexer && llama_step5_csa_z_cache()) {
         cache.kz_l.resize(n_layer, nullptr);
     }
+    // STEP5 block-summary cache: F16 store of the E4M3-rounded block_k.
+    if (has_step5_indexer) {
+        cache.kb_l.resize(n_layer, nullptr);
+    }
     if (has_qwen4exp_indexer) {
         cache.kp_l.resize(n_layer, nullptr);
     }
@@ -1682,6 +1687,14 @@ static bool llama_kv_cache_init(
                     ggml_format_name(idxz, "cache_kz_l%d", i);
                     cache.kz_l[i] = idxz;
                 }
+
+                // Cached block summaries. F16 holds every E4M3 value exactly, so this
+                // is the same value the csa_compress epilogue would round to.
+                const int64_t Bsel = hparams.indexer_csa_block > 0 ? hparams.indexer_csa_block : 8;
+                const int64_t n_blocks = (cache.rows(i) + Bsel - 1)/Bsel;
+                ggml_tensor * idxb = ggml_new_tensor_2d(ctx_idx, GGML_TYPE_F16, hparams.indexer_head_size, n_blocks);
+                ggml_format_name(idxb, "cache_kb_l%d", i);
+                cache.kb_l[i] = idxb;
             }
 
             auto k_name = std::string{"cache_k_l"} + std::to_string(i);
@@ -1814,6 +1827,9 @@ static bool llama_kv_cache_init(
     }
     for (size_t il = 0; il < cache.kp_l.size(); ++il) {
         GGML_ASSERT(cache.kp_l[il] == nullptr || cache.kp_l[il]->extra == nullptr);
+    }
+    for (size_t il = 0; il < cache.kb_l.size(); ++il) {
+        GGML_ASSERT(cache.kb_l[il] == nullptr || cache.kb_l[il]->extra == nullptr);
     }
 
     return true;
@@ -2110,6 +2126,8 @@ static void llama_kv_cache_compact_swa(struct llama_context & lctx, uint32_t n_t
 
     // kr_l rows moved => pooled block keys (kp_l) are stale; rebuild on the next graph.
     lctx.qsa_pooled_stale = lctx.qsa_pooled_stale || !cache.kp_l.empty();
+    // STEP5 summary blocks are keyed by cell index too; the move changes their members
+    cache.dsa_summary_stale = cache.dsa_summary_stale || !cache.kb_l.empty();
 
     cache.pos_base_swa += (llama_pos) drop;
     cache.head_swa      = cache.sink_rows + n_keep;
@@ -2818,6 +2836,7 @@ static bool llama_kv_cache_seq_rm(
             if (cache.cells[i].is_empty()) {
                 // keep count of the number of used cells
                 if (cache.cells[i].pos >= 0) cache.used--;
+                if (!cache.kb_l.empty()) cache.dsa_summary_stale = true;
 
                 cache.cells[i].pos = -1;
                 if (has_qnext_state) {
@@ -2909,6 +2928,7 @@ static void llama_kv_cache_seq_keep(struct llama_kv_cache & cache, llama_seq_id 
                 cache.cells[i].src = i;
             }
             cache.cells[i].seq_id.clear();
+            if (!cache.kb_l.empty()) cache.dsa_summary_stale = true;
             if (new_head == cache.size) new_head = i;
         } else {
             cache.cells[i].seq_id.clear();
@@ -2958,6 +2978,7 @@ static void llama_kv_cache_seq_add(
             cache.cells_disordered = true;
             cache.cells[i].pos   += delta;
             cache.cells[i].delta += delta;
+            if (!cache.kb_l.empty()) cache.dsa_summary_stale = true;
 
             if (cache.cells[i].pos < 0) {
                 if (!cache.cells[i].is_empty()) {
@@ -3006,6 +3027,7 @@ static void llama_kv_cache_seq_div(
     for (uint32_t i = 0; i < cache.size; ++i) {
         if (cache.cells[i].has_seq_id(seq_id) && cache.cells[i].pos >= p0 && cache.cells[i].pos < p1) {
             cache.has_shift = true;
+            if (!cache.kb_l.empty()) cache.dsa_summary_stale = true;
 
             {
                 llama_pos p_old = cache.cells[i].pos;
@@ -6030,6 +6052,61 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         }
     }
 
+    if (lctx.inp_step5_summary.win_blocks) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_step5_summary.win_blocks->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_step5_summary.win_cells->buffer));
+
+        const int64_t n_kv     = kv_self.n;
+        const int64_t B        = hparams.indexer_csa_block > 0 ? hparams.indexer_csa_block : 8;
+        const int64_t n_blocks = n_kv / B;
+        const int64_t n_win    = lctx.inp_step5_summary.win_blocks->ne[0];
+        GGML_ASSERT(n_kv % B == 0);
+        GGML_ASSERT(lctx.inp_step5_summary.win_cells->ne[0] == B*n_win);
+        GGML_ASSERT(lctx.inp_step5_summary.win_pos->ne[0] == B*n_win);
+
+        int32_t * dst_win_blk   = (int32_t *) lctx.inp_step5_summary.win_blocks->data;
+        int32_t * dst_win_cells = (int32_t *) lctx.inp_step5_summary.win_cells->data;
+        int32_t * dst_win_pos   = (int32_t *) lctx.inp_step5_summary.win_pos->data;
+
+        // only the blocks this ubatch writes into can have changed; a stale cache
+        // rebuilds every block once, then returns to touched-block updates
+        std::vector<int32_t> touched;
+        touched.reserve(n_win);
+        if (kv_self.dsa_summary_stale) {
+            for (int64_t b = 0; b < n_blocks; ++b) {
+                touched.push_back((int32_t) b);
+            }
+        } else {
+            for (int64_t i = 0; i < batch.n_tokens; ++i) {
+                const int32_t b = (int32_t) ((kv_self.head + i)/B);
+                if (b < n_blocks && std::find(touched.begin(), touched.end(), b) == touched.end()) {
+                    touched.push_back(b);
+                    if ((int64_t) touched.size() == n_win) {
+                        break;
+                    }
+                }
+            }
+        }
+        if (touched.empty()) {
+            touched.push_back(0);
+        }
+
+        for (int64_t w = 0; w < n_win; ++w) {
+            const int32_t b = touched[std::min<size_t>(w, touched.size() - 1)];
+            dst_win_blk[w] = b;
+            for (int64_t j = 0; j < B; ++j) {
+                const int32_t cell = (int32_t) (b*B + j);
+                dst_win_cells[w*B + j] = cell;
+                const llama_pos p = kv_self.cells[cell].pos;
+                dst_win_pos[w*B + j] = p < 0 ? 0 : (int32_t) p;
+            }
+        }
+
+        // a reused graph was built with the narrow window, so clearing on `touched`
+        // alone would leave the blocks it could not reach stale
+        kv_self.dsa_summary_stale = (int64_t) touched.size() > n_win;
+    }
+
     if (lctx.inp_dsa_sink) {
         // Per-sequence attention-sink boost for the DSA lightning indexer top-k selection.
         // inp_dsa_sink {n_kv, n_tokens}: 1e20 iff key cell i is one of query j's sequence's FIRST
@@ -8555,6 +8632,7 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
     // blocks are keyed by cell index, so moving cells changes every touched block's membership;
     // the pooled block keys must be rebuilt from the moved indexer keys
     lctx.qsa_pooled_stale = !kv_self.kp_l.empty();
+    kv_self.dsa_summary_stale = !kv_self.kb_l.empty();
 
     // defrag moves cells from the end of the cache into earlier holes
     kv_self.cells_disordered = true;
@@ -11757,6 +11835,26 @@ struct llama_data_write {
             }
         }
 
+        // STEP5 block-summary cache. Stored next to kr_l so a checkpoint can
+        // restore it directly instead of rebuilding from kz_l (which is not saved).
+        if (!kv_self.kb_l.empty()) {
+            write(&LLAMA_STEP5_SUMMARY_STATE_MAGIC, sizeof(LLAMA_STEP5_SUMMARY_STATE_MAGIC));
+            const int32_t Bsel = hparams.indexer_csa_block > 0 ? (int32_t) hparams.indexer_csa_block : 8;
+            const uint32_t n_blocks = kv_self.n / (uint32_t) Bsel;
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                const bool has_summary = il < kv_self.kb_l.size() && kv_self.kb_l[il] != nullptr;
+                const int32_t b_type_i = has_summary ? (int32_t) kv_self.kb_l[il]->type : -1;
+                write(&b_type_i, sizeof(b_type_i));
+                const uint64_t b_size_row = has_summary
+                    ? ggml_row_size(kv_self.kb_l[il]->type, kv_self.kb_l[il]->ne[0]) : 0;
+                write(&b_size_row, sizeof(b_size_row));
+                write(&n_blocks, sizeof(n_blocks));
+                if (has_summary && n_blocks != 0) {
+                    write_tensor_data(kv_self.kb_l[il], 0, (size_t) n_blocks * b_size_row, il);
+                }
+            }
+        }
+
         if (ctx->model.arch == LLM_ARCH_OPENPANGU) {
             write_openpangu_state(ctx, seq_id, false);
         }
@@ -12668,6 +12766,52 @@ struct llama_data_read {
                 }
             }
         }
+
+        // STEP5 block-summary cache.
+        if (!kv_self.kb_l.empty()) {
+            uint32_t summary_magic_ref = 0;
+            read_to(&summary_magic_ref, sizeof(summary_magic_ref));
+            if (summary_magic_ref != LLAMA_STEP5_SUMMARY_STATE_MAGIC) {
+                LLAMA_LOG_ERROR("%s: incompatible STEP5 summary state magic (0x%08x)\n", __func__, summary_magic_ref);
+                return false;
+            }
+            const int32_t Bsel = hparams.indexer_csa_block > 0 ? (int32_t) hparams.indexer_csa_block : 8;
+            const uint32_t n_blocks = kv_self.n / (uint32_t) Bsel;
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                const bool has_layer = il < kv_self.kb_l.size() && kv_self.kb_l[il] != nullptr;
+
+                int32_t b_type_i_ref;
+                uint64_t b_size_row_ref;
+                uint32_t b_blocks_ref;
+                read_to(&b_type_i_ref, sizeof(b_type_i_ref));
+                read_to(&b_size_row_ref, sizeof(b_size_row_ref));
+                read_to(&b_blocks_ref, sizeof(b_blocks_ref));
+
+                const int32_t b_type_i = has_layer ? (int32_t) kv_self.kb_l[il]->type : -1;
+                const size_t b_size_row = has_layer
+                    ? ggml_row_size(kv_self.kb_l[il]->type, kv_self.kb_l[il]->ne[0]) : 0;
+                if (b_type_i != b_type_i_ref) {
+                    LLAMA_LOG_ERROR("%s: mismatched STEP5 summary type (%d != %d, layer %u)\n",
+                            __func__, b_type_i, b_type_i_ref, il);
+                    return false;
+                }
+                if (b_size_row != b_size_row_ref) {
+                    LLAMA_LOG_ERROR("%s: mismatched STEP5 summary row size (%zu != %zu, layer %u)\n",
+                            __func__, (size_t) b_size_row, (size_t) b_size_row_ref, il);
+                    return false;
+                }
+                if (b_blocks_ref != n_blocks) {
+                    LLAMA_LOG_ERROR("%s: mismatched STEP5 summary block count (%u != %u, layer %u)\n",
+                            __func__, b_blocks_ref, n_blocks, il);
+                    return false;
+                }
+                if (has_layer && n_blocks != 0) {
+                    ggml_backend_tensor_set(kv_self.kb_l[il], read((size_t) n_blocks * b_size_row), 0,
+                            (size_t) n_blocks * b_size_row);
+                }
+            }
+        }
+        kv_self.dsa_summary_stale = false;
 
         // the pooled block keys are derived from the indexer keys restored just above, and the
         // builder rebuilds only the blocks an ubatch writes into, so the next graph must pool

@@ -120,6 +120,7 @@ void llm_build_context::init() {
         lctx.inp_K_shift     = nullptr;
         lctx.inp_kv_pos      = nullptr;
         lctx.inp_step5_cell_blk = nullptr;
+        lctx.inp_step5_summary = {};
         lctx.inp_mean        = nullptr;
         lctx.inp_cls         = nullptr;
         lctx.inp_s_copy      = nullptr;

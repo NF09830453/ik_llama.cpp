@@ -181,28 +181,42 @@ ggml_tensor * llm_build_context::build_step5_indexer_score(ggml_cgraph * gf, int
     w_cur = ggml_scale(ctx0, w_cur, 1.0f / sqrtf(float(head_size * n_ihead)));
     cb(w_cur, "step5_indexer_w", il);
 
-    ggml_tensor * cached_k = ggml_view_2d(ctx0, kr_cache, head_size, n_kv,
-            ggml_row_size(kr_cache->type, head_size), 0);
-    // De-rotate the whitened cache rows (H^2 == I).
-    ggml_tensor * k_f32;
-    if (ik_hadamard_enabled()) {
-        k_f32 = ggml_hadamard(ctx0, cached_k, (int) head_size);
-        cb(k_f32, "step5_indexer_k_derot", il);
-    } else {
-        k_f32 = ggml_cast(ctx0, ggml_cont(ctx0, cached_k), GGML_TYPE_F32);
-    }
-    cb(k_f32, "step5_indexer_cached_k", il);
+    const int64_t B = hparams.indexer_csa_block > 0 ? hparams.indexer_csa_block : 8;
+    GGML_ASSERT(B > 0 && n_kv % B == 0 && "CSA slot-aligned blocks need n_kv divisible by B");
+    const int64_t n_blocks = n_kv / B;
 
-    // Single-pass rope over [0..rope_dim) + passthrough of [rope_dim..head_size).
-    ggml_tensor * k_full = ggml_view_3d(ctx0, k_f32, head_size, 1, n_kv,
-            ggml_row_size(k_f32->type, head_size),
-            ggml_row_size(k_f32->type, head_size), 0);
-    ggml_tensor * indexer_k_b = ggml_rope_ext(ctx0, k_full, lctx.inp_kv_pos, nullptr, rope_dim,
-            rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
-    indexer_k_b = ggml_reshape_3d(ctx0, indexer_k_b, head_size, n_kv, 1);
-    indexer_k_b = step5_bf16_roundtrip(ctx0, indexer_k_b); // torch rope materializes bf16 output
-    cb(indexer_k_b, "step5_indexer_k_rope", il);
+    ggml_tensor * kb_cache = (size_t) il < kv_self.kb_l.size() ? kv_self.kb_l[il] : nullptr;
+    ggml_tensor * kz_cache = (size_t) il < kv_self.kz_l.size() ? kv_self.kz_l[il] : nullptr;
+    const bool summary_try = kb_cache && kz_cache &&
+        (kz_cache->type == GGML_TYPE_F16 || kz_cache->type == GGML_TYPE_F32);
+
+    // The summary path ropes only the touched cells below. Only the full fallback
+    // needs every cached key de-rotated and re-roped.
+    ggml_tensor * indexer_k_b = nullptr;
+    if (!summary_try) {
+        ggml_tensor * cached_k = ggml_view_2d(ctx0, kr_cache, head_size, n_kv,
+                ggml_row_size(kr_cache->type, head_size), 0);
+        // De-rotate the whitened cache rows (H^2 == I).
+        ggml_tensor * k_f32;
+        if (ik_hadamard_enabled()) {
+            k_f32 = ggml_hadamard(ctx0, cached_k, (int) head_size);
+            cb(k_f32, "step5_indexer_k_derot", il);
+        } else {
+            k_f32 = ggml_cast(ctx0, ggml_cont(ctx0, cached_k), GGML_TYPE_F32);
+        }
+        cb(k_f32, "step5_indexer_cached_k", il);
+
+        // Single-pass rope over [0..rope_dim) + passthrough of [rope_dim..head_size).
+        ggml_tensor * k_full = ggml_view_3d(ctx0, k_f32, head_size, 1, n_kv,
+                ggml_row_size(k_f32->type, head_size),
+                ggml_row_size(k_f32->type, head_size), 0);
+        indexer_k_b = ggml_rope_ext(ctx0, k_full, lctx.inp_kv_pos, nullptr, rope_dim,
+                rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        indexer_k_b = ggml_reshape_3d(ctx0, indexer_k_b, head_size, n_kv, 1);
+        indexer_k_b = step5_bf16_roundtrip(ctx0, indexer_k_b); // torch rope materializes bf16 output
+        cb(indexer_k_b, "step5_indexer_k_rope", il);
+    }
 
     // Scores: relu(q·k)·w summed over proxy heads at block grain, causal seed added last at slot granularity.
     // mask_f32 and vis are layer-invariant (same KQ_mask for every indexer layer): build once per graph.
@@ -262,17 +276,78 @@ ggml_tensor * llm_build_context::build_step5_indexer_score(ggml_cgraph * gf, int
     };
 
     ggml_tensor * slot_score;
-    const int64_t B = hparams.indexer_csa_block > 0 ? hparams.indexer_csa_block : 8;
     // Block-grain CSA with pooled block keys.
     {
-        GGML_ASSERT(B > 0 && n_kv % B == 0 && "CSA slot-aligned blocks need n_kv divisible by B");
-        const int64_t n_blocks = n_kv / B;
 
         ggml_tensor * vis = step5_vis;
         ggml_tensor * block_k;
         {
+            // Cached summaries: only the blocks this ubatch writes are repooled;
+            // every other block is read back from kb_l unchanged.
+            const int64_t n_win = kv_self.dsa_summary_stale ? n_blocks :
+                std::min<int64_t>(n_blocks, (n_tokens + B - 1)/B + 1);
+            if (summary_try) {
+                auto & inp = lctx.inp_step5_summary;
+                if (!inp.win_blocks) {
+                    inp.win_blocks = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_win);
+                    inp.win_cells  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, B*n_win);
+                    inp.win_pos    = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, B*n_win);
+                    cb(inp.win_blocks, "step5_summary_win_blocks", -1);
+                    cb(inp.win_cells,  "step5_summary_win_cells",  -1);
+                    cb(inp.win_pos,    "step5_summary_win_pos",    -1);
+                    ggml_set_input(inp.win_blocks);
+                    ggml_set_input(inp.win_cells);
+                    ggml_set_input(inp.win_pos);
+                    ggml_build_forward_expand(gf, inp.win_blocks);
+                    ggml_build_forward_expand(gf, inp.win_cells);
+                    ggml_build_forward_expand(gf, inp.win_pos);
+                }
+                GGML_ASSERT(inp.win_blocks->ne[0] == n_win);
+
+                ggml_tensor * kr_all = ggml_view_2d(ctx0, kr_cache, head_size, n_kv,
+                        ggml_row_size(kr_cache->type, head_size), 0);
+                ggml_tensor * z_all = ggml_view_2d(ctx0, kz_cache, head_size, n_kv,
+                        ggml_row_size(kz_cache->type, head_size), 0);
+                // csa_compress consumes flattened [head_size, B*n_win] keys and
+                // a [B*n_win] visibility vector, then returns [head_size, n_win]
+                ggml_tensor * members = ggml_get_rows(ctx0, kr_all, inp.win_cells);
+                if (members->type != GGML_TYPE_F32) {
+                    members = ggml_cast(ctx0, ggml_cont(ctx0, members), GGML_TYPE_F32);
+                }
+                if (ik_hadamard_enabled()) {
+                    members = ggml_hadamard(ctx0, members, (int) head_size);
+                }
+                // rope only the touched cells; their positions are unchanged
+                members = ggml_reshape_3d(ctx0, members, head_size, 1, B*n_win);
+                members = ggml_rope_ext(ctx0, members, inp.win_pos, nullptr, rope_dim,
+                        rope_type, n_ctx_orig, freq_base, freq_scale,
+                        ext_factor, attn_factor, beta_fast, beta_slow);
+                members = ggml_reshape_2d(ctx0, members, head_size, B*n_win);
+                members = step5_bf16_roundtrip(ctx0, members);
+                ggml_tensor * members_z = ggml_get_rows(ctx0, z_all, inp.win_cells);
+                // vis is [n_kv, 1]; get_rows selects along ne[0], so make each
+                // row one element wide and gather the per-cell visibility
+                ggml_tensor * vis2 = ggml_reshape_2d(ctx0, vis, 1, n_kv);
+                ggml_tensor * members_vis = ggml_get_rows(ctx0, vis2, inp.win_cells);
+                members_vis = ggml_reshape_1d(ctx0, members_vis, B*n_win);
+
+                ggml_tensor * block_k_new = ggml_csa_compress(ctx0, members_z, members, members_vis, (int) B, 1);
+                cb(block_k_new, "step5_indexer_block_k_new", il);
+                ggml_tensor * kb_all = ggml_set_rows(ctx0, kb_cache, block_k_new, inp.win_blocks);
+                cb(kb_all, "step5_indexer_block_k_scatter", il);
+                if (supports_op(block_k_new) && supports_op(kb_all)) {
+                    ggml_build_forward_expand(gf, kb_all);
+                    block_k = ggml_view_2d(ctx0, kb_all, head_size, n_blocks,
+                            ggml_row_size(kb_cache->type, head_size), 0);
+                    cb(block_k, "step5_indexer_block_k", il);
+                } else {
+                    block_k = nullptr;
+                }
+            } else {
+                block_k = nullptr;
+            }
+            if (!block_k) {
             // Official per-dimension softmax(z)-weighted mean.
-            ggml_tensor * kz_cache = (size_t) il < kv_self.kz_l.size() ? kv_self.kz_l[il] : nullptr;
             GGML_ASSERT(kz_cache && "official CSA needs the kz_l z cache (llama_step5_csa_z_cache)");
             if (kz_cache->type == GGML_TYPE_F16 || kz_cache->type == GGML_TYPE_F32) {
                 ggml_tensor * z_view = ggml_view_2d(ctx0, kz_cache, head_size, n_kv,
@@ -323,6 +398,7 @@ ggml_tensor * llm_build_context::build_step5_indexer_score(ggml_cgraph * gf, int
             // (round_e4m3=1), so it must not be rounded a second time.
             block_k = ggml_round_e4m3(ctx0, block_k);
             cb(block_k, "step5_indexer_block_k_e4m3", il);
+            }
             }
         }
 
@@ -400,6 +476,9 @@ ggml_tensor * llm_build_context::build_step5_indexer_score(ggml_cgraph * gf, int
 
 ggml_cgraph * llm_build_context::build_step5() {
     ggml_cgraph * gf = new_graph_custom();
+    // the summary window is sized from this graph's n_tokens; a rebuilt graph
+    // must not inherit the previous graph's input tensors
+    lctx.inp_step5_summary = {};
     static bool logged_path = false;
     if (!logged_path) {
         logged_path = true;

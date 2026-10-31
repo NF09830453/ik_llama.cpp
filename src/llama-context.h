@@ -147,6 +147,16 @@ struct llama_kv_cache {
 
     std::vector<struct ggml_tensor *> kz_l;
 
+    // STEP5 CSA block summaries: [indexer_head_size, kv_size/indexer_csa_block], F16.
+    // E4M3-rounded block_k values are exactly representable in F16, so this is a
+    // lossless store; only the blocks an ubatch writes are repooled and scattered.
+    std::vector<struct ggml_tensor *> kb_l;
+
+    // the cached block summaries no longer match the indexer keys; the next graph
+    // rebuilds every block, then returns to touched-block updates. Mutable because
+    // llama_set_inputs holds the cache as const and clears it after filling.
+    mutable bool dsa_summary_stale = false;
+
     // When true, the delta_net graph builder will enable per-step SSM state saves
     bool save_per_step_ssm = false;
 
@@ -722,6 +732,15 @@ struct llama_context {
         struct ggml_tensor * cut_mask   = nullptr;
     };
     std::vector<qsa_input> inp_qsa;
+
+    // STEP5 summary scatter: one entry per graph, shared by every indexer layer.
+    // Only the blocks this ubatch wrote are repooled; the rest stay in kb_l.
+    struct step5_summary_input {
+        struct ggml_tensor * win_blocks = nullptr; // I32 [n_win]       which block each entry rebuilds
+        struct ggml_tensor * win_cells  = nullptr; // I32 [B*n_win]      member cells of those blocks
+        struct ggml_tensor * win_pos    = nullptr; // I32 [B*n_win]      per-cell position for read-back rope
+    };
+    step5_summary_input inp_step5_summary;
 
     // the pooled block keys no longer match the raw indexer keys and the next built graph must
     // pool every block; set on state restore and defrag, cleared by that graph's host fill
