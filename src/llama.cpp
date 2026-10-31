@@ -596,6 +596,7 @@ struct llama_context::Prev {
     int n_outputs;
     int n_kv;
     int n_tokens;
+    int n_win;
     int save_per_step_ssm;
     int per_step_max_allocated;
     llama_mtp_op_type mtp_op_type;
@@ -709,6 +710,19 @@ bool llama_context::can_reuse_graph(const llama_batch & u_batch, uint64_t seq_fi
     if (model_state_hash != the_prev->model_state_hash) return false;
     auto & kv_self_used = (model.arch == LLM_ARCH_GEMMA4_MTP || model.arch == LLM_ARCH_GEMMA4_ASSISTANT) &&
                           mtp_target_ctx != nullptr ? mtp_target_ctx->kv_self : kv_self;
+    // the summary rebuild needs a graph with the full summary window; reusing a
+    // graph built before the rollback keeps the narrow window and the stale flag
+    // can never clear (MTP rollback sets dsa_summary_stale on every reject).
+    if (kv_self_used.dsa_summary_stale) return false;
+    if (!kv_self_used.kb_l.empty()) {
+        // the summary fill window is baked into the graph: reusing a wide graph for
+        // a narrow step (or vice versa) repools the wrong set of blocks
+        const int64_t B = model.hparams.indexer_csa_block > 0 ? model.hparams.indexer_csa_block : 8;
+        const int64_t n_blocks = (int64_t) kv_self_used.n / B;
+        const int64_t expected_n_win = kv_self_used.dsa_summary_stale ? n_blocks :
+            std::min<int64_t>(n_blocks, (u_batch.n_tokens + B - 1)/B + 1);
+        if (the_prev->n_win != expected_n_win) return false;
+    }
     if (the_prev->save_per_step_ssm != kv_self_used.save_per_step_ssm ||
         the_prev->per_step_max_allocated != kv_self_used.ckpt.per_step_max_allocated) return false;
     if (kv_self_used.any_compacted()) {
@@ -2766,7 +2780,8 @@ static bool llama_kv_cache_seq_rm(
         struct llama_kv_cache & cache,
                  llama_seq_id   seq_id,
                     llama_pos   p0,
-                    llama_pos   p1) {
+                    llama_pos   p1,
+                    bool        keep_summary = false) {
     uint32_t new_head = cache.size;
 
     if (p0 < 0) p0 = 0;
@@ -2836,7 +2851,7 @@ static bool llama_kv_cache_seq_rm(
             if (cache.cells[i].is_empty()) {
                 // keep count of the number of used cells
                 if (cache.cells[i].pos >= 0) cache.used--;
-                if (!cache.kb_l.empty()) cache.dsa_summary_stale = true;
+                if (!cache.kb_l.empty() && !keep_summary) cache.dsa_summary_stale = true;
 
                 cache.cells[i].pos = -1;
                 if (has_qnext_state) {
@@ -7923,11 +7938,16 @@ static int llama_decode_internal(
             printf("sched_alloc_graph(...): %d us\n", int(tim2-tim1));
 #endif
             if (u_batch.embd == nullptr && lctx.cparams.graph_reuse) {
+                const int64_t B = lctx.model.hparams.indexer_csa_block > 0 ? lctx.model.hparams.indexer_csa_block : 8;
                 auto & kv_self_used = (model.arch == LLM_ARCH_GEMMA4_MTP || model.arch == LLM_ARCH_GEMMA4_ASSISTANT) &&
                                       lctx.mtp_target_ctx != nullptr ? lctx.mtp_target_ctx->kv_self : lctx.kv_self;
                 prev = std::make_unique<llama_context::Prev>(llama_context::Prev{
                         (int)u_batch.all_seq_id, (int)lctx.n_outputs, (int)kv_self_used.n,
                         (int)u_batch.n_tokens,
+                        (int)(kv_self_used.kb_l.empty() ? 0 :
+                            (kv_self_used.dsa_summary_stale ? (int64_t) kv_self_used.n / B :
+                             std::min<int64_t>((int64_t) kv_self_used.n / B,
+                                 (u_batch.n_tokens + B - 1)/B + 1))),
                         kv_self_used.save_per_step_ssm, kv_self_used.ckpt.per_step_max_allocated,
                         cparams.mtp_op_type, lctx.mtp_step_idx, lctx.mtp_n_heads,
                         lctx.swa_window_view.w_view,
@@ -11234,7 +11254,7 @@ enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
         case LLAMA_SPEC_CKPT_PER_STEP: {
             if (llm_arch_is_dsv4(ctx->model.arch)) {
                 const llama_pos accepted_pos = n_past + accepted_step;
-                llama_kv_cache_seq_rm(kv, seq_id, accepted_pos + 1, -1);
+                llama_kv_cache_seq_rm(kv, seq_id, accepted_pos + 1, -1, true);
                 return llama_dsv4_spec_ckpt_restore(ctx, ckpt_type, true, accepted_step);
             }
             if (seq_id < 0 || !kv.per_step_restore(ctx->sched, ckpt_type, accepted_step, (uint32_t) seq_id)) {
@@ -11244,30 +11264,30 @@ enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
             if (seq_id >= 0 && (uint32_t)seq_id < kv.size) {
                 kv.cells[seq_id].pos = accepted_pos;
             }
-            llama_kv_cache_seq_rm(kv, seq_id, accepted_pos + 1, -1);
+            llama_kv_cache_seq_rm(kv, seq_id, accepted_pos + 1, -1, true);
             return LLAMA_SPEC_CKPT_RESTORE_DIRECT;
         }
 
         case LLAMA_SPEC_CKPT_GPU_FALLBACK:
             if (llm_arch_is_dsv4(ctx->model.arch)) {
-                llama_kv_cache_seq_rm(kv, seq_id, n_past, -1);
+                llama_kv_cache_seq_rm(kv, seq_id, n_past, -1, true);
                 return llama_dsv4_spec_ckpt_restore(ctx, ckpt_type, true, 0);
             }
             if (!kv.checkpoint_restore(ctx->sched, ckpt_type)) {
                 return LLAMA_SPEC_CKPT_RESTORE_FAILED;
             }
-            llama_kv_cache_seq_rm(kv, seq_id, n_past, -1);
+            llama_kv_cache_seq_rm(kv, seq_id, n_past, -1, true);
             return LLAMA_SPEC_CKPT_RESTORE_BASE_REPLAY_REQUIRED;
 
         case LLAMA_SPEC_CKPT_CPU: {
             if (llm_arch_is_dsv4(ctx->model.arch)) {
-                llama_kv_cache_seq_rm(kv, seq_id, n_past, -1);
+                llama_kv_cache_seq_rm(kv, seq_id, n_past, -1, true);
                 return llama_dsv4_spec_ckpt_restore(ctx, ckpt_type, false, 0);
             }
             const bool is_openpangu = ctx->model.arch == LLM_ARCH_OPENPANGU;
             if (is_openpangu) {
                 // conv state is position-strict, so the tail goes before it is written, with or without state
-                llama_kv_cache_seq_rm(kv, seq_id, n_past, -1);
+                llama_kv_cache_seq_rm(kv, seq_id, n_past, -1, true);
             }
             if (!ckpt.cpu_state_data.empty()) {
                 const size_t restored = llama_state_seq_set_data(
@@ -11278,7 +11298,7 @@ enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
                 }
             }
             if (!is_openpangu) {
-                llama_kv_cache_seq_rm(kv, seq_id, n_past, -1);
+                llama_kv_cache_seq_rm(kv, seq_id, n_past, -1, true);
             }
             return LLAMA_SPEC_CKPT_RESTORE_BASE_REPLAY_REQUIRED;
         }

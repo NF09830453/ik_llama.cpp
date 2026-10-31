@@ -13,7 +13,7 @@ static __global__ void k_indexer_pack(
         const int  * __restrict__ topk,
         const char * __restrict__ seed,
         int        * __restrict__ dst,
-        int n_kv, int kept, int total, int B, int n_tok,
+        int n_kv, int kept, int total, int B,
         size_t nb_topk1, size_t nb_seed1, size_t nb_dst1) {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
@@ -22,6 +22,7 @@ static __global__ void k_indexer_pack(
     extern __shared__ uint32_t s_mem[];
     uint32_t * seen = s_mem; // [n_words]
     __shared__ int s_count;
+    __shared__ int s_q_pos;
     __shared__ int s_scan[256];
 
     const int n_words = (n_kv + 31) >> 5;
@@ -30,6 +31,7 @@ static __global__ void k_indexer_pack(
     }
     if (tid == 0) {
         s_count = 0;
+        s_q_pos = -1;
     }
     __syncthreads();
 
@@ -45,14 +47,28 @@ static __global__ void k_indexer_pack(
         }
     }
 
-    // 2. Force-append the query's own (partial) block: derive it arithmetically
-    //    from n_kv/n_tok (q_pos = n_kv - n_tok + row) so no band tensor is needed.
-    //    Own block = [own0, q_pos], at most B cells.
-    const int q_pos = n_kv - n_tok + row;
-    const int own0  = (q_pos / B) * B;
-    for (int c = own0 + tid; c <= q_pos; c += nth) {
+    // 2. Force-append the query's own (partial) block. The query position is
+    //    the highest cell visible in this row's seed mask. Do NOT derive it from
+    //    n_kv/n_tok: n_kv is padded to the FA alignment (256) while the write
+    //    head is not, so that derivation targets an empty future block and
+    //    silently force-appends nothing. Reading it from the (graph-updated) mask
+    //    row is also safe under CUDA-graph replay. Own block = [own0, q_pos].
+    int local_q_pos = -1;
+    for (int c = tid; c < n_kv; c += nth) {
         if (!isinf((float)seed_row[c])) {
-            atomicOr(&seen[c >> 5], 1u << (c & 31));
+            local_q_pos = c;
+        }
+    }
+    atomicMax(&s_q_pos, local_q_pos);
+    __syncthreads();
+
+    const int q_pos = s_q_pos;
+    if (q_pos >= 0) {
+        const int own0 = (q_pos / B) * B;
+        for (int c = own0 + tid; c <= q_pos; c += nth) {
+            if (!isinf((float)seed_row[c])) {
+                atomicOr(&seen[c >> 5], 1u << (c & 31));
+            }
         }
     }
     __syncthreads();
@@ -127,12 +143,12 @@ void ggml_cuda_op_indexer_pack(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     if (seed->type == GGML_TYPE_F16) {
         k_indexer_pack<half><<<grid, k_block, smem, ctx.stream()>>>(
             (const int *)topk->data, (const char *)seed->data,
-            (int *)dst->data, n_kv, kept, total, B, n_tok,
+            (int *)dst->data, n_kv, kept, total, B,
             topk->nb[1], seed->nb[1], dst->nb[1]);
     } else {
         k_indexer_pack<float><<<grid, k_block, smem, ctx.stream()>>>(
             (const int *)topk->data, (const char *)seed->data,
-            (int *)dst->data, n_kv, kept, total, B, n_tok,
+            (int *)dst->data, n_kv, kept, total, B,
             topk->nb[1], seed->nb[1], dst->nb[1]);
     }
     CUDA_CHECK(cudaGetLastError());
