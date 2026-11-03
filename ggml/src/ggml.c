@@ -10718,13 +10718,26 @@ struct ggml_tensor * ggml_csa_compress(
     return result;
 }
 
+// INDEXER_PACK metadata mode: highest visible physical cell per seed row.
+struct ggml_tensor * ggml_indexer_pack_positions(
+        struct ggml_context * ctx, struct ggml_tensor * seed) {
+    GGML_ASSERT(seed->type == GGML_TYPE_F32 || seed->type == GGML_TYPE_F16);
+    GGML_ASSERT(seed->ne[2] == 1 && seed->ne[3] == 1);
+    GGML_ASSERT(seed->nb[0] == ggml_type_size(seed->type));
+    GGML_ASSERT(seed->ne[0] <= INT32_MAX);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, seed->ne[1]);
+    result->op = GGML_OP_INDEXER_PACK;
+    ggml_set_op_params_i32(result, 0, 1); // position-only metadata mode
+    ggml_set_op_params_i32(result, 1, (int32_t) seed->ne[0]);
+    result->src[0] = seed;
+    return result;
+}
+
 // topk [kept, n_tokens] I32 cell ids (fused topk output, descending score); seed
 // {n_kv, n_tokens} = dense causal mask (+ own-region exclusion band): a slot is visible iff
 // its seed value is finite. band {n_kv, n_tokens} F32: 1.0 on the own-region causal cells --
 // appended after the topk slots (the reference's topk+1 region). Packed slot =
 // cell_id | (visible << 24); dead slots = -1.
-// topk [kept, n_tokens] I32 cell ids (fused topk output, descending score); seed
-// {n_kv, n_tokens} mask view (dense causal [+ own-region -BIG band]); band {n_kv, n_tokens}
 // Output [kept + B, n_tokens] I32: slot = cell_id | (visible << 24), dead slots = -1
 // (invisible/garbage ids get valid=0; the attention kernel skips them). The
 // force-append set is the query's own partial block, derived from n_kv and n_band,
@@ -10741,6 +10754,10 @@ struct ggml_tensor * ggml_indexer_pack(
 
     struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, topk->ne[0] + n_band, topk->ne[1]);
     result->op = GGML_OP_INDEXER_PACK;
+    // Source extents affect kernel bounds even when output shape/addresses match.
+    GGML_ASSERT(seed->ne[0] <= INT32_MAX && topk->ne[0] <= INT32_MAX);
+    ggml_set_op_params_i32(result, 1, (int32_t) seed->ne[0]);
+    ggml_set_op_params_i32(result, 2, (int32_t) topk->ne[0]);
     result->src[0] = topk;
     result->src[1] = seed;
 
@@ -10767,6 +10784,13 @@ struct ggml_tensor * ggml_gather_sparse_attn(
     struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, q->ne[0], q->ne[2], q->ne[1]);
     result->op = GGML_OP_GATHER_SPARSE_ATTN;
     memcpy(result->op_params, &scale, sizeof(scale));
+    // CUDA graph properties include this node's shape/params and source
+    // addresses, but not source shapes. The packed row width controls the
+    // kernel's slot bound AND row stride without changing the output shape.
+    // Include it in the signature so allocator address reuse cannot replay a
+    // capture with stale slots (e.g. 72 -> 73 slots at the same addresses).
+    GGML_ASSERT(packed->ne[0] <= INT32_MAX);
+    ggml_set_op_params_i32(result, 1, (int32_t) packed->ne[0]);
     result->src[0] = q;
     result->src[1] = k;
     result->src[2] = v;

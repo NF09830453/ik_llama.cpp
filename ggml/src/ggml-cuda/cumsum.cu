@@ -20,7 +20,13 @@ static __global__ void cumsum_f32_kernel(
 
     extern __shared__ float s_scan[];
 
-    float carry = 0.0f;
+    // Every lane needs the same prefix from preceding tiles. A thread-local
+    // carry updated only by the last lane leaves all other lanes at zero.
+    __shared__ float carry;
+    if (threadIdx.x == 0) {
+        carry = 0.0f;
+    }
+    __syncthreads();
     for (int64_t start = 0; start < ne00; start += blockDim.x) {
         const int tile_n = (int) ((ne00 - start) < (int64_t) blockDim.x ? (ne00 - start) : (int64_t) blockDim.x);
 

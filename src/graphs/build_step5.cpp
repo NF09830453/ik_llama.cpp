@@ -2,6 +2,9 @@
 #include "../llama-model.h"
 #include "../llama-impl.h"
 #include <mutex>
+#include <cstdio>
+#include <cstring>
+#include <vector>
 #include "../llama-context.h"
 
 // Step-5 sparse GQA indexer: proxy-key cache write + read-back scoring graph.
@@ -222,6 +225,7 @@ ggml_tensor * llm_build_context::build_step5_indexer_score(ggml_cgraph * gf, int
     // mask_f32 and vis are layer-invariant (same KQ_mask for every indexer layer): build once per graph.
     if (step5_mask_key != KQ_mask) {
         step5_mask_key = KQ_mask;
+        step5_pack_positions = nullptr;
         step5_mask_f32 = ggml_view_2d(ctx0, KQ_mask, n_kv, n_tokens, KQ_mask->nb[1], 0);
         if (step5_mask_f32->type != GGML_TYPE_F32) {
             step5_mask_f32 = ggml_cast(ctx0, step5_mask_f32, GGML_TYPE_F32);
@@ -435,9 +439,36 @@ ggml_tensor * llm_build_context::build_step5_indexer_score(ggml_cgraph * gf, int
                 const bool kv_ok = il < (int64_t) lctx.kv_self.k_l.size() && lctx.kv_self.k_l[il] &&
                         lctx.kv_self.v_l[il] &&
                         ggml_gsa_kv_supported(lctx.kv_self.k_l[il]->type, lctx.kv_self.v_l[il]->type);
-                if (gather_try && kv_ok && packed_out && n_tokens <= 8 && cparams.flash_attn) {
-                    // Force-append = own (partial) block, derived in-kernel from n_kv.
+                const bool prefill_gather = getenv("IK_STEP5_PREFILL_GATHER") != nullptr;
+                if (gather_try && kv_ok && packed_out && (n_tokens <= 8 || prefill_gather) && cparams.flash_attn) {
+                    // Derive physical endpoints from actual causal visibility, never
+                    // from padded n_kv or logical inp_pos. Share once per mask/graph.
+                    ggml_tensor * positions = nullptr;
+                    // Decode too: one shared positions scan per graph beats a full n_kv
+                    // rescan inside every indexer layer's pack kernel.
+                    const bool pack_rescan_pos = getenv("IK_STEP5_PACK_RESCAN_POS") != nullptr ||
+                        (n_tokens > 8 && getenv("IK_STEP5_PREFILL_RESCAN_POS") != nullptr);
+                    if (!pack_rescan_pos) {
+                        if (!step5_pack_positions) {
+                            ggml_tensor * candidate = ggml_indexer_pack_positions(ctx0, mask_f32);
+                            if (supports_op(candidate)) {
+                                step5_pack_positions = candidate;
+                                cb(candidate, "step5_pack_positions", -1);
+                            }
+                        }
+                        positions = step5_pack_positions;
+                    }
                     ggml_tensor * pack = ggml_indexer_pack(ctx0, topk, mask_f32, (int) B);
+                    pack->src[5] = positions; // src[2..4] reserved for PACK_CHECK witnesses
+
+                    if (getenv("IK_STEP5_PACK_CHECK")) {
+                        // Diagnostic-only dependency: compare against the actual masked path.
+                        pack->src[2] = ggml_indexer_mask_own(ctx0, KQ_mask, topk, band01);
+                        // Keep witnesses live until the host diagnostic has read them.
+                        pack->src[3] = band01;
+                        pack->src[4] = KQ_mask;
+                        cb(pack->src[2], "step5_pack_reference", il);
+                    }
                     if (supports_op(pack)) {
                         log_idx_path(1, il, n_tokens, n_kv, lctx.cparams.cb_eval);
                         cb(pack, "step5_indexer_pack", il);

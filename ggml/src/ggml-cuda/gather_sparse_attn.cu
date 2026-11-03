@@ -8,57 +8,8 @@
 #define GSA_V2_MAX_WARPS 32 // head_dim / n_head_kv must be <= this
 #define GSA_V2_TKV 8        // KV rows dequantized per shared-memory tile
 
-static __device__ inline float gsa_dequant(ggml_type type, const char * row, int i) {
-    switch (type) {
-        case GGML_TYPE_F16:
-            return __half2float(*(const half *)(row + i * sizeof(half)));
-        case GGML_TYPE_F32:
-            return *(const float *)(row + i * sizeof(float));
-        case GGML_TYPE_Q8_0: {
-            const block_q8_0 * b = (const block_q8_0 *)(row + (i / QK8_0) * sizeof(block_q8_0));
-            return __half2float(b->d) * (float)b->qs[i % QK8_0];
-        }
-        case GGML_TYPE_Q6_0: {
-            const block_q6_0 * b = (const block_q6_0 *)(row + (i / QK6_0) * sizeof(block_q6_0));
-            const int j = i % QK6_0;
-            if (j < QK6_0 / 2) {
-                const uint8_t h = b->qh[j % (QK6_0 / 4)] >> (4 * (j / (QK6_0 / 4)));
-                return __half2float(b->d) * (float)(((b->qs[j] & 0x0F) | ((h << 4) & 0x30)) - 32);
-            }
-            const int j2 = j - QK6_0 / 2;
-            const uint8_t h = b->qh[j2 % (QK6_0 / 4)] >> (4 * (j2 / (QK6_0 / 4)));
-            return __half2float(b->d) * (float)(((b->qs[j2] >> 4) | ((h << 2) & 0x30)) - 32);
-        }
-        case GGML_TYPE_Q5_0: {
-            const block_q5_0 * b = (const block_q5_0 *)(row + (i / QK5_0) * sizeof(block_q5_0));
-            const int j = i % QK5_0;
-            const int xh = ((b->qh[j >> 3] >> (j & 7)) & 1) << 4;
-            const int xl = (j < QK5_0 / 2) ? (b->qs[j] & 0x0F) : (b->qs[j - QK5_0 / 2] >> 4);
-            return __half2float(b->d) * (float)((xl | xh) - 16);
-        }
-        case GGML_TYPE_Q5_1: {
-            const block_q5_1 * b = (const block_q5_1 *)(row + (i / QK5_1) * sizeof(block_q5_1));
-            const int j = i % QK5_1;
-            const int xh = ((b->qh[j >> 3] >> (j & 7)) & 1) << 4;
-            const int xl = (j < QK5_1 / 2) ? (b->qs[j] & 0x0F) : (b->qs[j - QK5_1 / 2] >> 4);
-            return __half2float(b->data.d) * (float)(xl | xh) + __half2float(b->data.m);
-        }
-        case GGML_TYPE_Q4_0: {
-            const block_q4_0 * b = (const block_q4_0 *)(row + (i / QK4_0) * sizeof(block_q4_0));
-            const int j = i % QK4_0;
-            const int q = (j < QK4_0 / 2 ? (b->qs[j] & 0x0F) : (b->qs[j - QK4_0 / 2] >> 4)) - 8;
-            return __half2float(b->d) * (float)q;
-        }
-        case GGML_TYPE_Q4_1: {
-            const block_q4_1 * b = (const block_q4_1 *)(row + (i / QK4_1) * sizeof(block_q4_1));
-            const int j = i % QK4_1;
-            const int q = (j < QK4_1 / 2) ? (b->qs[j] & 0x0F) : (b->qs[j - QK4_1 / 2] >> 4);
-            return __half2float(b->data.d) * (float)q + __half2float(b->data.m);
-        }
-        default:
-            return 0.0f;
-    }
-}
+#include "gather_sparse_dequant.cuh"
+#include "gather_sparse_attn_prefill.cuh"
 
 // Dequantize one packed row into `dst` with the type switch hoisted out of the
 // element loop (lets the compiler specialize/vectorize each case). `tid`/`nth`
@@ -492,6 +443,13 @@ void ggml_cuda_op_gather_sparse_attn(ggml_backend_cuda_context & ctx, ggml_tenso
     const int n_kv     = (int)k->ne[1];
     const int n_tokens = (int)q->ne[1];
 
+    // Same packed-cell contract; unsupported devices/shapes retain the existing
+    // gather implementation, never dense attention on a discarded sparse mask.
+    if (n_tokens > 8 && ggml_cuda_gather_sparse_attn_prefill(ctx, dst)) {
+        gsa_time_log("gather_sparse_attn_prefill", _t0, n_kv);
+        return;
+    }
+
     const bool use_v1 = getenv("IK_GSA_V1") != nullptr || H > GSA_V2_MAX_WARPS || K <= 0;
 
     if (use_v1) {
@@ -513,6 +471,10 @@ void ggml_cuda_op_gather_sparse_attn(ggml_backend_cuda_context & ctx, ggml_tenso
     int n_splits = (K + 31) / 32;
     if (n_splits < 1)   n_splits = 1;
     if (n_splits > 128) n_splits = 128;
+    // Prefill already supplies parallelism across query rows. Avoid multiplying
+    // its scratch allocation and CTA count by the decode split count. Each CTA
+    // streams the complete selected set with the same online softmax as decode.
+    if (n_tokens > 8) n_splits = 1;
     const int n_head_kv = (int)k->ne[2];
 
     ggml_cuda_pool_alloc<float> partial_acc(ctx.pool(), (int64_t)n_splits * n_tokens * n_head * d);

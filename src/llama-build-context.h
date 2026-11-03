@@ -118,6 +118,7 @@ struct llm_build_context {
     // Built once per graph build and shared across indexer layers (member defaults to null).
     struct ggml_tensor * step5_mask_key = nullptr;
     struct ggml_tensor * step5_mask_f32 = nullptr;
+    struct ggml_tensor * step5_pack_positions = nullptr;
     struct ggml_tensor * step5_vis      = nullptr;
     struct ggml_tensor * step5_band_key = nullptr;
     struct ggml_tensor * step5_mseed    = nullptr;

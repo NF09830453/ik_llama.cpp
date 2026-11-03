@@ -2733,6 +2733,10 @@ extern "C" {
     // n_kv and n_band (= B), so no band tensor is needed; cells already present in
     // the topk list are dropped, not duplicated.
     // Output: [kept + B, n_tokens] I32, packed = cell_id | (visible << 24); dead slots -1.
+    // INDEXER_PACK metadata mode: highest visible physical cell per seed row.
+    GGML_API struct ggml_tensor * ggml_indexer_pack_positions(
+            struct ggml_context * ctx, struct ggml_tensor * seed);
+
     GGML_API struct ggml_tensor * ggml_indexer_pack(
             struct ggml_context * ctx,
             struct ggml_tensor  * topk,

@@ -4622,6 +4622,12 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
             break;
         }
 
+        // Host pack diagnostics must execute on every invocation, outside capture.
+        if (node->op == GGML_OP_INDEXER_PACK && node->src[2]) {
+            use_cuda_graph = false;
+            break;
+        }
+
         // C12: the indexer_pack -> gather_sparse_attn pair is unordered under stream
         // capture (gather reads pre-pack arena contents at decode); run these eagerly.
         // if (node->op == GGML_OP_INDEXER_PACK || node->op == GGML_OP_GATHER_SPARSE_ATTN) {

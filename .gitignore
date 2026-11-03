@@ -162,3 +162,16 @@ a.out
 a.out.*
 .dev
 .github
+
+# --- Local C12 scratch / data (never publish) ---
+/_*
+/prod-logs/
+/quantscripts/
+/test-models/
+/*.imatrix
+/*.imatrix.*
+/*.raw
+/step5-q8_0-logits_B.resume
+/dsv3_tok.json
+/step5-llamacpp.patch
+/mainline-step35.cpp

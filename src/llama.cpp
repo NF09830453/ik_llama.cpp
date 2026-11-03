@@ -12796,7 +12796,11 @@ struct llama_data_read {
                 return false;
             }
             const int32_t Bsel = hparams.indexer_csa_block > 0 ? (int32_t) hparams.indexer_csa_block : 8;
-            const uint32_t n_blocks = kv_self.n / (uint32_t) Bsel;
+            // The serialized count is the SAVED active extent, not the current
+            // one: an early checkpoint can be restored after kv_self.n grows.
+            // The next decode recomputes kv_self.n from the restored cells.
+            const uint32_t block_capacity = kv_self.size / (uint32_t) Bsel;
+            uint32_t saved_blocks = 0;
             for (uint32_t il = 0; il < n_layer; ++il) {
                 const bool has_layer = il < kv_self.kb_l.size() && kv_self.kb_l[il] != nullptr;
 
@@ -12820,14 +12824,16 @@ struct llama_data_read {
                             __func__, (size_t) b_size_row, (size_t) b_size_row_ref, il);
                     return false;
                 }
-                if (b_blocks_ref != n_blocks) {
-                    LLAMA_LOG_ERROR("%s: mismatched STEP5 summary block count (%u != %u, layer %u)\n",
-                            __func__, b_blocks_ref, n_blocks, il);
+                if (il == 0) saved_blocks = b_blocks_ref;
+                if (b_blocks_ref != saved_blocks || b_blocks_ref > block_capacity ||
+                    (has_layer && (uint64_t) b_blocks_ref > (uint64_t) kv_self.kb_l[il]->ne[1])) {
+                    LLAMA_LOG_ERROR("%s: invalid STEP5 summary block count (%u, saved=%u, capacity=%u, layer %u)\n",
+                            __func__, b_blocks_ref, saved_blocks, block_capacity, il);
                     return false;
                 }
-                if (has_layer && n_blocks != 0) {
-                    ggml_backend_tensor_set(kv_self.kb_l[il], read((size_t) n_blocks * b_size_row), 0,
-                            (size_t) n_blocks * b_size_row);
+                if (has_layer && b_blocks_ref != 0) {
+                    ggml_backend_tensor_set(kv_self.kb_l[il], read((size_t) b_blocks_ref * b_size_row), 0,
+                            (size_t) b_blocks_ref * b_size_row);
                 }
             }
         }
