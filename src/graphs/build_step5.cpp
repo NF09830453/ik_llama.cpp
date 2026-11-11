@@ -523,7 +523,9 @@ ggml_cgraph * llm_build_context::build_step5() {
 
     if (cparams.mtp_op_type != MTP_OP_NONE) {
         GGML_ASSERT(model.mtp && hparams.nextn_predict_layers > 0);
-        GGML_ASSERT(batch.token && "Step5 MTP requires token batches");
+        // Media prompt warmup supplies projected embeddings instead of token IDs.
+        // build_inp_embd_mtp() handles both input forms.
+        GGML_ASSERT((batch.token || batch.embd) && "Step5 MTP requires tokens or embeddings");
 
         const int n_layer_base = hparams.n_layer > hparams.nextn_predict_layers
             ? hparams.n_layer - hparams.nextn_predict_layers : hparams.n_layer;
