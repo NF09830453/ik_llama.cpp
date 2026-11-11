@@ -656,7 +656,7 @@ ggml_cgraph * llm_build_context::build_step5() {
         cur = build_std_attention(gf, model.layers[il].attn_norm, inpL,
                 inp_pos, il == n_layer_base - 1 && n_tokens > 1 && !cparams.mtp ? inp_out_ids : nullptr,
                 rope_factors, attn_mask, nullptr, nullptr, kq_scale, 0.0f, is_swa ? hparams.n_swa : 0,
-                il, true, false, true, false, false, nullptr, -1, 0.0f, nullptr, nullptr, nullptr, packed);
+                il, true, false, true, false, false, nullptr, -1, 0.0f, nullptr, nullptr, nullptr, nullptr, nullptr, packed);
         layer.rope_freqs = rope_freqs;
 
         if (model.layers[il].ffn_gate_inp == nullptr) {
