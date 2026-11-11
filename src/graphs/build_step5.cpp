@@ -427,7 +427,7 @@ ggml_tensor * llm_build_context::build_step5_indexer_score(ggml_cgraph * gf, int
                 ggml_build_forward_expand(gf, lctx.inp_step5_cell_blk);
             }
             ggml_tensor * topk = ggml_indexer_topk(ctx0, block_k, q_cur, w_cur, mseed,
-                    lctx.inp_step5_cell_blk, GGML_UNARY_OP_RELU, (int) kept);
+                    lctx.inp_step5_cell_blk, GGML_UNARY_OP_RELU, (int) kept, 0, false, nullptr);
             if (supports_op(topk)) {
                 cb(topk, "step5_indexer_topk", il);
                 ggml_build_forward_expand(gf, topk);

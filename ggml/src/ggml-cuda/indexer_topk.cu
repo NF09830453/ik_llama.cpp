@@ -951,7 +951,7 @@ static void mask_topk_to_index_dense(ggml_backend_cuda_context & ctx, const ggml
     const size_t nb1 = src->ne[0]*sizeof(mask_t);
     k_indexer_mask<<<dst->ne[1], 256, 0, ctx.stream()>>>(src->ne[0], dst->ne[1], 1, topk->ne[0], topk->ne[1],
             src->nb[1], 0, 0, topk->nb[1], 0, 0, nb1, 0, 0,
-            (const mask_t *)src->data, (const int *)topk->data, mask.get());
+            (const mask_t *)src->data, (const int *)topk->data, nullptr, mask.get());
     k_mask_to_index<<<dst->ne[1], WARP_SIZE, 0, ctx.stream()>>>(src->ne[0], dst->ne[0], nb1, 0, 0, dst->nb[1], 0, 0,
             mask.get(), (int *)dst->data);
 }
